@@ -140,7 +140,10 @@ impl ListenerStatus {
     }
 
     pub fn is_live(&self, maximum_idle: Duration) -> bool {
-        self.is_listening() && self.idle_for().is_some_and(|idle| idle <= maximum_idle)
+        match self.idle_for() {
+            Some(idle) => self.is_listening() && idle <= maximum_idle,
+            None => false,
+        }
     }
 }
 
@@ -322,9 +325,10 @@ fn worker_loop(
             }
             Ok(path_metadata) => {
                 let path_identity = FileIdentity::from_metadata(&path_metadata);
-                let replaced = open_log
-                    .as_ref()
-                    .is_some_and(|log: &OpenLog| log.identity != path_identity);
+                let replaced = match open_log.as_ref() {
+                    Some(log) => log.identity != path_identity,
+                    None => false,
+                };
                 if replaced {
                     open_log = None;
                 }
@@ -497,9 +501,8 @@ fn consume_bytes(
             let line = incomplete_line
                 .strip_suffix(b"\r")
                 .unwrap_or(incomplete_line.as_slice());
-            if let Ok(line) = std::str::from_utf8(line)
-                && let Some(event) = parse_bridge_record(line)
-            {
+            let event = std::str::from_utf8(line).ok().and_then(parse_bridge_record);
+            if let Some(event) = event {
                 deliver(event);
             }
             incomplete_line.clear();
@@ -562,8 +565,6 @@ impl FileIdentity {
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct FileIdentity {
-    volume: Option<u32>,
-    index: Option<u64>,
     creation_time: u64,
 }
 
@@ -572,8 +573,6 @@ impl FileIdentity {
     fn from_metadata(metadata: &fs::Metadata) -> Self {
         use std::os::windows::fs::MetadataExt;
         Self {
-            volume: metadata.volume_serial_number(),
-            index: metadata.file_index(),
             creation_time: metadata.creation_time(),
         }
     }
