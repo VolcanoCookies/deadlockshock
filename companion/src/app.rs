@@ -1,8 +1,11 @@
 use std::ops::RangeInclusive;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
+use std::time::Duration;
 
+use crate::bridge_listener::{BridgeEvent, ConsoleLogListener, ListenerPhase, ListenerStatus};
 use crate::deadlock_path::{self, Detection, DetectionError};
 use egui::{Color32, TextEdit, Ui};
 use pishock::{Credentials, Device, Error as PiShockError, WebSocketClient};
@@ -47,29 +50,6 @@ impl ShockMode {
         match self {
             Self::Interval => "Interval",
             Self::Fixed => "Fixed",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum ListeningState {
-    Listening,
-    #[default]
-    NotListening,
-}
-
-impl ListeningState {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Listening => "Server listening",
-            Self::NotListening => "Server not listening",
-        }
-    }
-
-    fn color(self) -> [f32; 4] {
-        match self {
-            Self::Listening => [0.30, 0.78, 0.42, 1.0],
-            Self::NotListening => [0.65, 0.65, 0.65, 1.0],
         }
     }
 }
@@ -147,13 +127,16 @@ pub struct AppState {
     pub max_duration: f32,
     pub duration: f32,
     pub log_path: String,
-    pub listening_state: ListeningState,
     client: Option<Arc<WebSocketClient>>,
     connection_error: Option<String>,
     connection_result: Option<Receiver<ConnectionResult>>,
     beep_result: Option<Receiver<BeepResult>>,
     beep_status: Option<BeepStatus>,
     log_detection_status: Option<LogDetectionStatus>,
+    bridge_listener: ConsoleLogListener,
+    bridge_events: Option<Receiver<BridgeEvent>>,
+    last_bridge_event: Option<BridgeEvent>,
+    listener_action_error: Option<String>,
 }
 
 impl AppState {
@@ -297,7 +280,47 @@ impl AppState {
         });
     }
 
+    fn ensure_bridge_subscription(&mut self) {
+        if self.bridge_events.is_none() {
+            self.bridge_events = Some(self.bridge_listener.subscribe());
+        }
+    }
+
+    fn start_log_listener(&mut self, path: PathBuf) -> std::io::Result<()> {
+        self.ensure_bridge_subscription();
+        self.bridge_listener.start(path)
+    }
+
+    fn poll_bridge_events(&mut self) {
+        loop {
+            let result = self.bridge_events.as_ref().map(Receiver::try_recv);
+            match result {
+                Some(Ok(event)) => self.last_bridge_event = Some(event),
+                Some(Err(TryRecvError::Empty)) | None => break,
+                Some(Err(TryRecvError::Disconnected)) => {
+                    self.bridge_events = None;
+                    break;
+                }
+            }
+        }
+    }
+
+    fn start_listener_from_input(&mut self) {
+        let path = self.log_path.trim();
+        if path.is_empty() {
+            self.listener_action_error =
+                Some("Enter a console.log path before starting the listener.".to_owned());
+            return;
+        }
+        let path = PathBuf::from(path);
+        self.listener_action_error = self
+            .start_log_listener(path)
+            .err()
+            .map(|error| format!("Could not start listener: {error}"));
+    }
+
     fn auto_detect_log_path(&mut self) {
+        self.listener_action_error = None;
         self.apply_log_detection(deadlock_path::detect());
     }
 
@@ -305,11 +328,21 @@ impl AppState {
         match result {
             Ok(Detection::Ready { path }) => {
                 self.log_path = path.display().to_string();
-                self.log_detection_status = Some(LogDetectionStatus::Found);
+                self.log_detection_status = match self.start_log_listener(path) {
+                    Ok(()) => Some(LogDetectionStatus::Found),
+                    Err(error) => Some(LogDetectionStatus::Failed(format!(
+                        "Deadlock console.log was found, but the listener could not start: {error}"
+                    ))),
+                };
             }
             Ok(Detection::NotCreated { path }) => {
                 self.log_path = path.display().to_string();
-                self.log_detection_status = Some(LogDetectionStatus::NotCreated);
+                self.log_detection_status = match self.start_log_listener(path) {
+                    Ok(()) => Some(LogDetectionStatus::NotCreated),
+                    Err(error) => Some(LogDetectionStatus::Failed(format!(
+                        "Deadlock was found, but the listener could not start: {error}"
+                    ))),
+                };
             }
             Err(error) => {
                 self.log_detection_status = Some(LogDetectionStatus::Failed(format!(
@@ -322,6 +355,7 @@ impl AppState {
     pub fn draw(&mut self, ui: &mut Ui) {
         self.poll_beep();
         self.poll_connection_test();
+        self.poll_bridge_events();
 
         ui.heading("Credentials");
         let busy = self.connection_in_progress() || self.beep_in_progress();
@@ -464,27 +498,87 @@ impl AppState {
         }
 
         text_input(ui, "Log path", &mut self.log_path, false);
-        if ui
-            .add_sized(
-                [ui.available_width(), 0.0],
-                egui::Button::new("Auto-detect"),
-            )
-            .clicked()
-        {
-            self.auto_detect_log_path();
-        }
+        ui.horizontal(|ui| {
+            if ui
+                .add_sized(
+                    [ui.available_width() * 0.5, 0.0],
+                    egui::Button::new("Auto-detect"),
+                )
+                .clicked()
+            {
+                self.auto_detect_log_path();
+            }
+            if ui
+                .add_sized(
+                    [ui.available_width(), 0.0],
+                    egui::Button::new("Start/Restart listener"),
+                )
+                .clicked()
+            {
+                self.start_listener_from_input();
+            }
+        });
         if let Some(status) = &self.log_detection_status {
             status_line(ui, status.label(), status.color());
         }
-        ui.add_space(8.0);
-        ui.separator();
-        ui.add_space(8.0);
+        if let Some(error) = &self.listener_action_error {
+            status_line(ui, error, [0.92, 0.32, 0.28, 1.0]);
+        }
+        let listener_status = self.bridge_listener.status();
+        draw_listener_status(ui, &listener_status, self.last_bridge_event.as_ref());
+        if listener_status.phase != ListenerPhase::Stopped {
+            ui.ctx().request_repaint_after(Duration::from_millis(250));
+        }
+    }
+}
 
-        status_line(
-            ui,
-            self.listening_state.label(),
-            self.listening_state.color(),
-        );
+fn draw_listener_status(ui: &mut Ui, status: &ListenerStatus, last_event: Option<&BridgeEvent>) {
+    let (phase_label, phase_color) = match status.phase {
+        ListenerPhase::Stopped => ("Listener stopped.".to_owned(), [0.65, 0.65, 0.65, 1.0]),
+        ListenerPhase::WaitingForFile => (
+            "Listener waiting for console.log to be created.".to_owned(),
+            [0.92, 0.68, 0.22, 1.0],
+        ),
+        ListenerPhase::Listening => (
+            "Listener is monitoring console.log.".to_owned(),
+            [0.30, 0.78, 0.42, 1.0],
+        ),
+        ListenerPhase::Failed => (
+            format!(
+                "Listener failed: {}",
+                status.current_error.as_deref().unwrap_or("unknown error")
+            ),
+            [0.92, 0.32, 0.28, 1.0],
+        ),
+    };
+
+    if let Some(path) = &status.configured_path {
+        ui.label(format!("Configured listener path: {}", path.display()));
+    }
+    status_line(ui, &phase_label, phase_color);
+
+    let activity = status
+        .last_activity_at
+        .map(|at| format!("Last log activity: {} ago.", format_duration(at.elapsed())))
+        .unwrap_or_else(|| "Last log activity: none since listener start.".to_owned());
+    ui.label(activity);
+
+    let event = match (last_event, status.last_event_at) {
+        (Some(event), Some(at)) => format!(
+            "Last bridge event: {} ({} ago).",
+            event.event_name(),
+            format_duration(at.elapsed())
+        ),
+        _ => "Last bridge event: none since listener start.".to_owned(),
+    };
+    ui.label(event);
+}
+
+fn format_duration(duration: Duration) -> String {
+    if duration.as_secs() >= 60 {
+        format!("{}m {}s", duration.as_secs() / 60, duration.as_secs() % 60)
+    } else {
+        format!("{:.1}s", duration.as_secs_f32())
     }
 }
 

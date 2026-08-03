@@ -323,6 +323,8 @@ dependencies = [
  "eframe",
  "egui",
  "pishock",
+ "serde",
+ "serde_json",
  "steamlocate",
  "tempfile",
  "winreg",
