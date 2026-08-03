@@ -173,6 +173,27 @@ impl ConnectedProvider {
             _ => Err(ProviderError::NotConnected),
         }
     }
+    pub fn shock(
+        &self,
+        target: &ProviderTarget,
+        intensity: u8,
+        duration_ms: u64,
+    ) -> Result<(), ProviderError> {
+        if !target_matches(self.kind(), target.id()) {
+            return Err(ProviderError::TargetProviderMismatch);
+        }
+        match (self, target.data.as_ref()) {
+            (Self::PiShock(client), Some(TargetData::PiShock(device))) => {
+                client.shock_device(device, intensity, duration_ms)?;
+                Ok(())
+            }
+            (Self::OpenShock(client), Some(TargetData::OpenShock(group))) => {
+                client.shock(group, intensity, duration_ms)?;
+                Ok(())
+            }
+            _ => Err(ProviderError::NotConnected),
+        }
+    }
     pub fn disconnect(self) -> Result<(), ProviderError> {
         match self {
             Self::PiShock(_) => Ok(()),

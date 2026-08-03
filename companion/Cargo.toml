@@ -11,6 +11,7 @@ openshock = { path = "../openshock" }
 steamlocate = "2.1"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
+rand = "0.9"
 serde_json = "1"
 
 [target.'cfg(windows)'.dependencies]

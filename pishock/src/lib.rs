@@ -150,9 +150,12 @@ pub enum Error {
     /// An intensity was outside 1 through 100.
     #[error("intensity must be between 1 and 100")]
     InvalidIntensity,
-    /// A duration was outside 1 through 15 seconds.
+    /// A legacy command duration was outside 1 through 15 seconds.
     #[error("duration must be between 1 and 15 seconds")]
     InvalidDuration,
+    /// A WebSocket command duration was outside 300 through 65535 milliseconds.
+    #[error("WebSocket duration must be between 300 and 65535 milliseconds")]
+    InvalidWebSocketDuration,
     /// The API key authentication request was rejected.
     #[error("PiShock authentication was rejected")]
     AuthenticationRejected,

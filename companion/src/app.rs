@@ -1,16 +1,19 @@
 use std::ops::RangeInclusive;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 use std::time::Duration;
 
-use crate::bridge_listener::{BridgeEvent, ConsoleLogListener, ListenerPhase, ListenerStatus};
+use crate::bridge_listener::{
+    BridgeEvent, ConsoleLogListener, ListenerPhase, ListenerStatus, LocalPlayerDeath,
+};
 use crate::deadlock_path::{self, Detection, DetectionError};
 use crate::provider::{
     ConnectedProvider, ProviderCredentials, ProviderError, ProviderKind, ProviderTarget, TargetId,
 };
 use egui::{Color32, TextEdit, Ui};
+use rand::Rng;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum CredentialState {
@@ -80,7 +83,6 @@ impl LogDetectionStatus {
 
 type ConnectionResult = Result<(ConnectedProvider, Vec<ProviderTarget>), ProviderError>;
 type SoundResult = Result<(), ProviderError>;
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum SoundStatus {
     Sending,
@@ -103,8 +105,128 @@ impl SoundStatus {
         }
     }
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResolvedShock {
+    pub intensity: u8,
+    pub duration_ms: u64,
+}
 
-#[derive(Default)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DeathIdentity {
+    session_id: String,
+    sequence: u64,
+    client_time_ms: u64,
+    detection: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ShockRequest {
+    provider: ProviderKind,
+    target: Option<ProviderTarget>,
+    resolved: Option<ResolvedShock>,
+    death: DeathIdentity,
+}
+
+struct ShockJob {
+    client: Arc<ConnectedProvider>,
+    request: ShockRequest,
+}
+
+struct ShockCompletion {
+    request: ShockRequest,
+    result: Result<(), ProviderError>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ShockStatus {
+    Sending(ShockRequest),
+    Sent(ShockRequest),
+    Failed {
+        request: ShockRequest,
+        error: String,
+    },
+    Skipped {
+        request: ShockRequest,
+        reason: String,
+    },
+}
+impl ShockStatus {
+    fn request(&self) -> &ShockRequest {
+        match self {
+            Self::Sending(request)
+            | Self::Sent(request)
+            | Self::Failed { request, .. }
+            | Self::Skipped { request, .. } => request,
+        }
+    }
+    fn label(&self) -> String {
+        let request = self.request();
+        let target = request
+            .target
+            .as_ref()
+            .map(|target| target.name())
+            .unwrap_or("no target");
+        let resolved = request
+            .resolved
+            .map(|resolved| {
+                format!(
+                    "{}% for {:.1} s",
+                    resolved.intensity,
+                    resolved.duration_ms as f32 / 1_000.0
+                )
+            })
+            .unwrap_or_else(|| "settings unavailable".to_owned());
+        let death = format!("{}#{}", request.death.session_id, request.death.sequence);
+        match self {
+            Self::Sending(_) => format!(
+                "{}: Sending shock to {target} at {resolved} (death {death})…",
+                request.provider.label()
+            ),
+            Self::Sent(_) => format!(
+                "{}: Shock sent to {target} at {resolved} (death {death}).",
+                request.provider.label()
+            ),
+            Self::Failed { error, .. } => format!(
+                "{}: Shock failed for {target} at {resolved} (death {death}): {error}",
+                request.provider.label()
+            ),
+            Self::Skipped { reason, .. } => format!(
+                "{}: Shock skipped for {target} at {resolved} (death {death}): {reason}",
+                request.provider.label()
+            ),
+        }
+    }
+    fn color(&self) -> [f32; 4] {
+        match self {
+            Self::Sending(_) => [0.65, 0.65, 0.65, 1.0],
+            Self::Sent(_) => [0.30, 0.78, 0.42, 1.0],
+            Self::Failed { .. } => [0.92, 0.32, 0.28, 1.0],
+            Self::Skipped { .. } => [0.92, 0.68, 0.22, 1.0],
+        }
+    }
+}
+
+fn spawn_shock_worker() -> (Sender<ShockJob>, Receiver<ShockCompletion>) {
+    let (job_sender, job_receiver) = mpsc::channel::<ShockJob>();
+    let (completion_sender, completion_receiver) = mpsc::channel::<ShockCompletion>();
+    thread::spawn(move || {
+        while let Ok(job) = job_receiver.recv() {
+            let result = match (job.request.target.as_ref(), job.request.resolved) {
+                (Some(target), Some(resolved)) => {
+                    job.client
+                        .shock(target, resolved.intensity, resolved.duration_ms)
+                }
+                _ => Err(ProviderError::NotConnected),
+            };
+            let _ = completion_sender.send(ShockCompletion {
+                request: job.request,
+                result,
+            });
+        }
+    });
+    (job_sender, completion_receiver)
+}
+
 pub struct AppState {
     pub provider: ProviderKind,
     pub username: String,
@@ -126,11 +248,54 @@ pub struct AppState {
     connection_result: Option<Receiver<ConnectionResult>>,
     sound_result: Option<Receiver<SoundResult>>,
     sound_status: Option<SoundStatus>,
+    shock_sender: Sender<ShockJob>,
+    shock_result: Receiver<ShockCompletion>,
+    shock_in_flight: usize,
+    shock_status: Option<ShockStatus>,
     log_detection_status: Option<LogDetectionStatus>,
     bridge_listener: ConsoleLogListener,
     bridge_events: Option<Receiver<BridgeEvent>>,
     last_bridge_event: Option<BridgeEvent>,
+    last_death: Option<(String, u64)>,
     listener_action_error: Option<String>,
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        let (shock_sender, shock_result) = spawn_shock_worker();
+        Self {
+            provider: ProviderKind::default(),
+            username: String::new(),
+            api_key: String::new(),
+            openshock_token: String::new(),
+            credential_state: CredentialState::default(),
+            devices: Vec::new(),
+            selected_device: None,
+            shock_mode: ShockMode::default(),
+            min_intensity: 1.0,
+            max_intensity: 1.0,
+            intensity: 1.0,
+            min_duration: 0.3,
+            max_duration: 0.3,
+            duration: 0.3,
+            log_path: String::new(),
+            client: None,
+            connection_error: None,
+            connection_result: None,
+            sound_result: None,
+            sound_status: None,
+            shock_sender,
+            shock_result,
+            shock_in_flight: 0,
+            shock_status: None,
+            log_detection_status: None,
+            bridge_listener: ConsoleLogListener::default(),
+            bridge_events: None,
+            last_bridge_event: None,
+            last_death: None,
+            listener_action_error: None,
+        }
+    }
 }
 
 impl AppState {
@@ -159,11 +324,14 @@ impl AppState {
     fn sound_in_progress(&self) -> bool {
         self.sound_result.is_some()
     }
+    fn shock_in_progress(&self) -> bool {
+        self.shock_in_flight != 0
+    }
     fn reset_connection(&mut self) {
-        if let Some(client) = self.client.take() {
-            if let Ok(client) = Arc::try_unwrap(client) {
-                let _ = client.disconnect();
-            }
+        if let Some(client) = self.client.take()
+            && let Ok(client) = Arc::try_unwrap(client)
+        {
+            let _ = client.disconnect();
         }
         self.credential_state = CredentialState::Unknown;
         self.connection_result = None;
@@ -174,7 +342,10 @@ impl AppState {
         self.sound_status = None;
     }
     fn set_provider(&mut self, provider: ProviderKind) {
-        if self.provider != provider && !self.connection_in_progress() && !self.sound_in_progress()
+        if self.provider != provider
+            && !self.connection_in_progress()
+            && !self.sound_in_progress()
+            && !self.shock_in_progress()
         {
             self.provider = provider;
             self.reset_connection();
@@ -279,6 +450,122 @@ impl AppState {
             Err(error) => SoundStatus::Failed(format!("Test sound failed: {error}")),
         });
     }
+    pub fn resolve_shock(&self) -> Option<ResolvedShock> {
+        let mut rng = rand::rng();
+        self.resolve_shock_with(&mut rng)
+    }
+    fn resolve_shock_with<R: Rng + ?Sized>(&self, rng: &mut R) -> Option<ResolvedShock> {
+        let intensity = match self.shock_mode {
+            ShockMode::Fixed => portable_intensity(self.intensity)?,
+            ShockMode::Interval => {
+                let min = portable_intensity(self.min_intensity)?;
+                let max = portable_intensity(self.max_intensity)?;
+                if min > max {
+                    return None;
+                }
+                rng.random_range(min..=max)
+            }
+        };
+        let duration_ms = match self.shock_mode {
+            ShockMode::Fixed => portable_duration(self.duration)?,
+            ShockMode::Interval => {
+                let min = portable_duration(self.min_duration)?;
+                let max = portable_duration(self.max_duration)?;
+                if min > max {
+                    return None;
+                }
+                rng.random_range(min..=max)
+            }
+        };
+        Some(ResolvedShock {
+            intensity,
+            duration_ms,
+        })
+    }
+    fn poll_shock(&mut self) {
+        loop {
+            match self.shock_result.try_recv() {
+                Ok(completion) => {
+                    self.shock_in_flight = self.shock_in_flight.saturating_sub(1);
+                    self.shock_status = Some(match completion.result {
+                        Ok(()) => ShockStatus::Sent(completion.request),
+                        Err(error) => ShockStatus::Failed {
+                            request: completion.request,
+                            error: error.to_string(),
+                        },
+                    });
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    self.shock_in_flight = 0;
+                    break;
+                }
+            }
+        }
+    }
+    fn death_is_new(&mut self, death: &LocalPlayerDeath) -> bool {
+        if let Some((session_id, sequence)) = &self.last_death
+            && session_id == &death.session_id
+            && death.sequence <= *sequence
+        {
+            return false;
+        }
+        self.last_death = Some((death.session_id.clone(), death.sequence));
+        true
+    }
+    fn queue_death_shock(&mut self, death: LocalPlayerDeath) {
+        if !self.death_is_new(&death) {
+            return;
+        }
+        let request = ShockRequest {
+            provider: self.provider,
+            target: self.selected_device().cloned(),
+            resolved: self.resolve_shock(),
+            death: DeathIdentity {
+                session_id: death.session_id,
+                sequence: death.sequence,
+                client_time_ms: death.client_time_ms,
+                detection: death.detection,
+            },
+        };
+        let Some(client) = self.client.clone() else {
+            self.shock_status = Some(ShockStatus::Skipped {
+                request,
+                reason: "provider is not connected".to_owned(),
+            });
+            return;
+        };
+        if request.target.is_none() {
+            self.shock_status = Some(ShockStatus::Skipped {
+                request,
+                reason: "no target is selected".to_owned(),
+            });
+            return;
+        }
+        if request.resolved.is_none() {
+            self.shock_status = Some(ShockStatus::Skipped {
+                request,
+                reason: "shock settings are invalid".to_owned(),
+            });
+            return;
+        }
+        self.shock_status = Some(ShockStatus::Sending(request.clone()));
+        self.shock_in_flight = self.shock_in_flight.saturating_add(1);
+        if self
+            .shock_sender
+            .send(ShockJob {
+                client,
+                request: request.clone(),
+            })
+            .is_err()
+        {
+            self.shock_in_flight = self.shock_in_flight.saturating_sub(1);
+            self.shock_status = Some(ShockStatus::Failed {
+                request,
+                error: "shock worker is unavailable".to_owned(),
+            });
+        }
+    }
     fn ensure_bridge_subscription(&mut self) {
         if self.bridge_events.is_none() {
             self.bridge_events = Some(self.bridge_listener.subscribe());
@@ -289,11 +576,16 @@ impl AppState {
         self.bridge_listener.start(path)
     }
     fn poll_bridge_events(&mut self) {
-        loop {
-            match self.bridge_events.as_ref().map(Receiver::try_recv) {
-                Some(Ok(event)) => self.last_bridge_event = Some(event),
-                Some(Err(TryRecvError::Empty)) | None => break,
-                Some(Err(TryRecvError::Disconnected)) => {
+        while let Some(result) = self.bridge_events.as_ref().map(Receiver::try_recv) {
+            match result {
+                Ok(event) => {
+                    self.last_bridge_event = Some(event.clone());
+                    if let BridgeEvent::LocalPlayerDeath(death) = event {
+                        self.queue_death_shock(death);
+                    }
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
                     self.bridge_events = None;
                     break;
                 }
@@ -347,8 +639,10 @@ impl AppState {
     pub fn draw(&mut self, ui: &mut Ui) {
         self.poll_sound();
         self.poll_connection_test();
+        self.poll_shock();
         self.poll_bridge_events();
-        let busy = self.connection_in_progress() || self.sound_in_progress();
+        let busy =
+            self.connection_in_progress() || self.sound_in_progress() || self.shock_in_progress();
         ui.heading("Provider");
         let mut provider = self.provider;
         ui.add_enabled_ui(!busy, |ui| {
@@ -405,8 +699,10 @@ impl AppState {
         ui.separator();
         ui.add_space(8.0);
         ui.heading("Device group");
-        let selection_enabled =
-            !self.devices.is_empty() && !self.connection_in_progress() && !self.sound_in_progress();
+        let selection_enabled = !self.devices.is_empty()
+            && !self.connection_in_progress()
+            && !self.sound_in_progress()
+            && !self.shock_in_progress();
         let selected_name = self
             .selected_device()
             .map(|device| device.name().to_owned())
@@ -451,55 +747,71 @@ impl AppState {
         if let Some(status) = &self.sound_status {
             status_line(ui, status.label(), status.color());
         }
+        if let Some(status) = &self.shock_status {
+            let label = status.label();
+            status_line(ui, &label, status.color());
+        }
         ui.add_space(8.0);
         ui.separator();
         ui.add_space(8.0);
-        ui.heading("Shock mode");
-        ui.horizontal(|ui| {
-            ui.label("Mode");
-            egui::ComboBox::from_id_salt("shock-mode")
-                .selected_text(self.shock_mode.label())
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.shock_mode, ShockMode::Interval, "Interval");
-                    ui.selectable_value(&mut self.shock_mode, ShockMode::Fixed, "Fixed");
-                });
+        ui.add_enabled_ui(!busy, |ui| {
+            ui.heading("Shock mode");
+            ui.horizontal(|ui| {
+                ui.label("Mode");
+                egui::ComboBox::from_id_salt("shock-mode")
+                    .selected_text(self.shock_mode.label())
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.shock_mode, ShockMode::Interval, "Interval");
+                        ui.selectable_value(&mut self.shock_mode, ShockMode::Fixed, "Fixed");
+                    });
+            });
+            ui.add_space(4.0);
+            match self.shock_mode {
+                ShockMode::Interval => {
+                    slider_input(
+                        ui,
+                        "Minimum intensity",
+                        &mut self.min_intensity,
+                        1.0..=100.0,
+                        1.0,
+                        "%",
+                    );
+                    slider_input(
+                        ui,
+                        "Maximum intensity",
+                        &mut self.max_intensity,
+                        1.0..=100.0,
+                        1.0,
+                        "%",
+                    );
+                    slider_input(
+                        ui,
+                        "Minimum duration",
+                        &mut self.min_duration,
+                        0.3..=3.0,
+                        0.1,
+                        " s",
+                    );
+                    slider_input(
+                        ui,
+                        "Maximum duration",
+                        &mut self.max_duration,
+                        0.3..=3.0,
+                        0.1,
+                        " s",
+                    );
+                }
+                ShockMode::Fixed => {
+                    slider_input(ui, "Intensity", &mut self.intensity, 1.0..=100.0, 1.0, "%");
+                    slider_input(ui, "Duration", &mut self.duration, 0.3..=3.0, 0.1, " s");
+                }
+            }
         });
-        ui.add_space(4.0);
-        match self.shock_mode {
-            ShockMode::Interval => {
-                slider_input(
-                    ui,
-                    "Minimum intensity",
-                    &mut self.min_intensity,
-                    0.0..=100.0,
-                    "",
-                );
-                slider_input(
-                    ui,
-                    "Maximum intensity",
-                    &mut self.max_intensity,
-                    0.0..=100.0,
-                    "",
-                );
-                slider_input(
-                    ui,
-                    "Minimum duration",
-                    &mut self.min_duration,
-                    0.0..=3.0,
-                    " s",
-                );
-                slider_input(
-                    ui,
-                    "Maximum duration",
-                    &mut self.max_duration,
-                    0.0..=3.0,
-                    " s",
-                );
-            }
-            ShockMode::Fixed => {
-                slider_input(ui, "Intensity", &mut self.intensity, 0.0..=100.0, "");
-                slider_input(ui, "Duration", &mut self.duration, 0.0..=3.0, " s");
-            }
+        if self.min_intensity > self.max_intensity {
+            self.max_intensity = self.min_intensity;
+        }
+        if self.min_duration > self.max_duration {
+            self.max_duration = self.min_duration;
         }
         text_input(ui, "Log path", &mut self.log_path, false);
         ui.horizontal(|ui| {
@@ -530,12 +842,22 @@ impl AppState {
         }
         let listener_status = self.bridge_listener.status();
         draw_listener_status(ui, &listener_status, self.last_bridge_event.as_ref());
-        if listener_status.phase != ListenerPhase::Stopped {
+        if listener_status.phase != ListenerPhase::Stopped || self.shock_in_progress() {
             ui.ctx().request_repaint_after(Duration::from_millis(250));
         }
     }
 }
 
+fn portable_intensity(value: f32) -> Option<u8> {
+    (value.is_finite() && value.fract() == 0.0 && (1.0..=100.0).contains(&value))
+        .then_some(value as u8)
+}
+fn portable_duration(value: f32) -> Option<u64> {
+    if !value.is_finite() || !(0.3..=3.0).contains(&value) {
+        return None;
+    }
+    Some((value * 1_000.0).round() as u64)
+}
 fn draw_listener_status(ui: &mut Ui, status: &ListenerStatus, last_event: Option<&BridgeEvent>) {
     let (phase_label, phase_color) = match status.phase {
         ListenerPhase::Stopped => ("Listener stopped.".to_owned(), [0.65, 0.65, 0.65, 1.0]),
@@ -594,11 +916,12 @@ fn text_input(ui: &mut Ui, label: &str, value: &mut String, password: bool) -> b
     )
     .changed()
 }
-fn slider_input(
+fn slider_input<T: egui::emath::Numeric>(
     ui: &mut Ui,
     label: &str,
-    value: &mut f32,
-    range: RangeInclusive<f32>,
+    value: &mut T,
+    range: RangeInclusive<T>,
+    step: f64,
     suffix: &str,
 ) {
     ui.label(label);
@@ -608,7 +931,7 @@ fn slider_input(
         visuals.widgets.inactive.bg_fill = input_background();
         visuals.widgets.hovered.bg_fill = input_background();
         visuals.widgets.active.bg_fill = input_background();
-        ui.add(egui::Slider::new(value, range).suffix(suffix));
+        ui.add(egui::Slider::new(value, range).step_by(step).suffix(suffix));
     });
 }
 fn status_line(ui: &mut Ui, value: &str, color: [f32; 4]) {
@@ -739,6 +1062,124 @@ mod tests {
                 .label()
                 .contains("-condebug")
         );
+    }
+    fn death(session_id: &str, sequence: u64) -> LocalPlayerDeath {
+        LocalPlayerDeath {
+            schema: 1,
+            session_id: session_id.to_owned(),
+            client_time_ms: sequence,
+            sequence,
+            detection: "test".to_owned(),
+        }
+    }
+    #[test]
+    fn shock_settings_use_portable_bounds_and_fixed_values() {
+        let state = AppState {
+            shock_mode: ShockMode::Fixed,
+            intensity: 37.0,
+            duration: 1.234,
+            ..AppState::default()
+        };
+        assert_eq!(
+            state.resolve_shock(),
+            Some(ResolvedShock {
+                intensity: 37,
+                duration_ms: 1_234
+            })
+        );
+        let interval = AppState::default();
+        assert_eq!(
+            interval.resolve_shock(),
+            Some(ResolvedShock {
+                intensity: 1,
+                duration_ms: 300
+            })
+        );
+        assert_eq!(
+            (AppState {
+                shock_mode: ShockMode::Fixed,
+                intensity: 0.0,
+                ..AppState::default()
+            })
+            .resolve_shock(),
+            None
+        );
+        assert_eq!(
+            (AppState {
+                min_intensity: 90.0,
+                max_intensity: 10.0,
+                ..AppState::default()
+            })
+            .resolve_shock(),
+            None
+        );
+    }
+    #[test]
+    fn death_deduplication_accepts_new_sessions_without_hook_ready() {
+        let mut state = AppState::default();
+        state.queue_death_shock(death("first", 4));
+        let first = state.shock_status.clone();
+        state.queue_death_shock(death("first", 4));
+        assert_eq!(state.shock_status, first);
+        state.queue_death_shock(death("first", 3));
+        assert_eq!(state.shock_status, first);
+        state.queue_death_shock(death("second", 1));
+        assert_ne!(state.shock_status, first);
+    }
+    #[test]
+    fn hook_ready_is_observed_but_never_triggers_a_shock() {
+        let (sender, receiver) = mpsc::channel();
+        let mut state = AppState {
+            bridge_events: Some(receiver),
+            ..AppState::default()
+        };
+        sender
+            .send(BridgeEvent::HookReady(crate::bridge_listener::HookReady {
+                schema: 1,
+                session_id: "session".to_owned(),
+                client_time_ms: 1,
+                poll_interval_ms: 100,
+            }))
+            .unwrap();
+        state.poll_bridge_events();
+        assert!(state.last_death.is_none());
+        assert!(state.shock_status.is_none());
+    }
+    #[test]
+    fn missing_prerequisites_are_recorded_as_skipped() {
+        let mut state = AppState::default();
+        state.queue_death_shock(death("session", 1));
+        assert!(matches!(
+            state.shock_status,
+            Some(ShockStatus::Skipped { .. })
+        ));
+        assert_eq!(state.shock_in_flight, 0);
+    }
+    #[test]
+    fn shock_status_contains_provider_target_values_and_death_identity() {
+        let request = ShockRequest {
+            provider: ProviderKind::OpenShock,
+            target: Some(ProviderTarget::new(
+                TargetId::OpenShock("group".to_owned()),
+                "group",
+            )),
+            resolved: Some(ResolvedShock {
+                intensity: 20,
+                duration_ms: 500,
+            }),
+            death: DeathIdentity {
+                session_id: "session".to_owned(),
+                sequence: 9,
+                client_time_ms: 42,
+                detection: "test".to_owned(),
+            },
+        };
+        let status = ShockStatus::Sent(request);
+        let label = status.label();
+        assert!(label.contains("OpenShock"));
+        assert!(label.contains("group"));
+        assert!(label.contains("20% for 0.5 s"));
+        assert!(label.contains("session#9"));
     }
     #[test]
     fn failed_detection_does_not_replace_manual_path() {

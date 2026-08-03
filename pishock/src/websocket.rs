@@ -12,6 +12,9 @@ use crate::{
     expect_status, redact_api_key, validate_credentials, validate_duration,
 };
 
+const MIN_WEBSOCKET_DURATION_MS: u64 = 300;
+const MAX_WEBSOCKET_DURATION_MS: u64 = u16::MAX as u64;
+
 /// A connected client for account-owned devices and WebSocket commands.
 ///
 /// Connecting authenticates the API key once and stores the resulting user ID.
@@ -92,6 +95,38 @@ impl WebSocketClient {
     /// Beeps every unpaused shocker paired to an owned hub.
     pub fn beep_device(&self, device: &Device, duration: u8) -> Result<(), Error> {
         validate_duration(duration)?;
+        let payload = self.owned_device_payload(device, "b", 0, u64::from(duration) * 1_000)?;
+        self.publish(&payload)
+    }
+
+    /// Shocks every unpaused shocker paired to an owned hub.
+    ///
+    /// `duration_ms` is expressed in milliseconds and must be between
+    /// `MIN_WEBSOCKET_DURATION_MS` and `MAX_WEBSOCKET_DURATION_MS` inclusive,
+    /// matching the WebSocket command's unsigned 16-bit duration field.
+    pub fn shock_device(
+        &self,
+        device: &Device,
+        intensity: u8,
+        duration_ms: u64,
+    ) -> Result<(), Error> {
+        if !(1..=100).contains(&intensity) {
+            return Err(Error::InvalidIntensity);
+        }
+        if !(MIN_WEBSOCKET_DURATION_MS..=MAX_WEBSOCKET_DURATION_MS).contains(&duration_ms) {
+            return Err(Error::InvalidWebSocketDuration);
+        }
+        let payload = self.owned_device_payload(device, "s", intensity, duration_ms)?;
+        self.publish(&payload)
+    }
+
+    fn owned_device_payload(
+        &self,
+        device: &Device,
+        mode: &'static str,
+        intensity: u8,
+        duration: u64,
+    ) -> Result<String, Error> {
         let shockers: Vec<&Shocker> = device
             .shockers
             .iter()
@@ -101,7 +136,7 @@ impl WebSocketClient {
             return Err(Error::NoAvailableShockers);
         }
 
-        let payload = serde_json::to_string(&WebSocketRequest {
+        serde_json::to_string(&WebSocketRequest {
             operation: "PUBLISH",
             publish_commands: shockers
                 .into_iter()
@@ -109,9 +144,9 @@ impl WebSocketClient {
                     target: format!("c{}-ops", device.client_id),
                     body: OwnedCommandBody {
                         id: shocker.shocker_id,
-                        mode: "b",
-                        intensity: 0,
-                        duration: u64::from(duration) * 1_000,
+                        mode,
+                        intensity,
+                        duration,
                         repeating: true,
                         log: CommandLog {
                             user_id: self.user_id,
@@ -126,9 +161,7 @@ impl WebSocketClient {
         })
         .map_err(|_| Error::Decode {
             operation: "owned device command",
-        })?;
-
-        self.publish(&payload)
+        })
     }
 
     fn publish(&self, payload: &str) -> Result<(), Error> {

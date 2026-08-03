@@ -324,6 +324,138 @@ fn beep_device_publishes_to_every_unpaused_shocker() {
 }
 
 #[test]
+fn shock_device_publishes_exact_payload_to_every_unpaused_shocker() {
+    let (websocket_url, websocket_server) = start_websocket_server(
+        r#"{"ErrorCode":null,"IsError":false,"Message":"Publish successful.","OriginalCommand":"PUBLISH"}"#,
+    );
+    let mut server = Server::new();
+    let (mut client, _authentication) = websocket_client(&mut server);
+    client.urls.websocket = websocket_url;
+    let device = owned_device(vec![
+        Shocker {
+            name: "One".into(),
+            shocker_id: 9,
+            is_paused: false,
+        },
+        Shocker {
+            name: "Paused".into(),
+            shocker_id: 10,
+            is_paused: true,
+        },
+        Shocker {
+            name: "Two".into(),
+            shocker_id: 11,
+            is_paused: false,
+        },
+    ]);
+
+    client.shock_device(&device, 37, 1_234).unwrap();
+
+    assert_eq!(
+        websocket_server.join().unwrap(),
+        json!({
+            "Operation": "PUBLISH",
+            "PublishCommands": [
+                {
+                    "Target": "c7-ops",
+                    "Body": {
+                        "id": 9,
+                        "m": "s",
+                        "i": 37,
+                        "d": 1234,
+                        "r": true,
+                        "l": {
+                            "u": 42,
+                            "ty": "api",
+                            "w": false,
+                            "h": false,
+                            "o": SENDER
+                        }
+                    }
+                },
+                {
+                    "Target": "c7-ops",
+                    "Body": {
+                        "id": 11,
+                        "m": "s",
+                        "i": 37,
+                        "d": 1234,
+                        "r": true,
+                        "l": {
+                            "u": 42,
+                            "ty": "api",
+                            "w": false,
+                            "h": false,
+                            "o": SENDER
+                        }
+                    }
+                }
+            ]
+        })
+    );
+}
+
+#[test]
+fn shock_device_validates_before_networking_and_requires_available_shockers() {
+    let mut server = Server::new();
+    let (mut client, _authentication) = websocket_client(&mut server);
+    client.urls.websocket = "not-a-websocket-url".into();
+    let active = owned_device(vec![Shocker {
+        name: "Active".into(),
+        shocker_id: 9,
+        is_paused: false,
+    }]);
+    let paused = owned_device(vec![Shocker {
+        name: "Paused".into(),
+        shocker_id: 10,
+        is_paused: true,
+    }]);
+
+    assert_eq!(
+        client.shock_device(&active, 0, 1_000),
+        Err(Error::InvalidIntensity)
+    );
+    assert_eq!(
+        client.shock_device(&active, 101, 1_000),
+        Err(Error::InvalidIntensity)
+    );
+    assert_eq!(
+        client.shock_device(&active, 50, 299),
+        Err(Error::InvalidWebSocketDuration)
+    );
+    assert_eq!(
+        client.shock_device(&active, 50, 65_536),
+        Err(Error::InvalidWebSocketDuration)
+    );
+    assert_eq!(
+        client.shock_device(&paused, 50, 1_000),
+        Err(Error::NoAvailableShockers)
+    );
+}
+
+#[test]
+fn shock_device_redacts_api_keys_from_rejections_and_attempts_once() {
+    let response = format!(
+        r#"{{"ErrorCode":"Rejected","IsError":true,"Message":"command rejected for {API_KEY}","OriginalCommand":"PUBLISH"}}"#
+    );
+    let (websocket_url, websocket_server) = start_websocket_server(response);
+    let mut server = Server::new();
+    let (mut client, _authentication) = websocket_client(&mut server);
+    client.urls.websocket = websocket_url;
+    let device = owned_device(vec![Shocker {
+        name: "Active".into(),
+        shocker_id: 9,
+        is_paused: false,
+    }]);
+
+    let error = client.shock_device(&device, 1, 300).unwrap_err();
+
+    websocket_server.join().unwrap();
+    assert!(matches!(error, Error::WebSocketRejected { .. }));
+    assert!(!format!("{error:?} {error}").contains(API_KEY));
+}
+
+#[test]
 fn beep_device_validates_duration_and_available_shockers() {
     let mut server = Server::new();
     let (client, _authentication) = websocket_client(&mut server);

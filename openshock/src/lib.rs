@@ -114,6 +114,8 @@ pub enum Error {
     CommandRejected { message: String },
     #[error("the selected OpenShock group has no available shockers")]
     NoAvailableShockers,
+    #[error("OpenShock command intensity must be between 1 and 100")]
+    InvalidIntensity,
     #[error("OpenShock command duration must be between 300 and 65535 milliseconds")]
     InvalidDuration,
     #[error("OpenShock connection is closed")]
@@ -197,20 +199,25 @@ impl OpenShockClient {
 
     pub fn test_sound(&self, group: &DeviceGroup, duration_ms: u64) -> Result<(), Error> {
         validate_duration(duration_ms)?;
-        let shockers: Vec<&Shocker> = group
-            .shockers
-            .iter()
-            .filter(|shocker| !shocker.paused)
-            .collect();
-        if shockers.is_empty() {
-            return Err(Error::NoAvailableShockers);
-        }
+        let shockers = available_shockers(group)?;
         let mut worker = self.worker.lock().map_err(|_| Error::Disconnected)?;
         let commands = shockers
             .iter()
             .map(|shocker| sound_command(&shocker.id, duration_ms))
             .collect();
-        worker.invoke_sound(commands)
+        worker.invoke(commands)
+    }
+
+    pub fn shock(&self, group: &DeviceGroup, intensity: u8, duration_ms: u64) -> Result<(), Error> {
+        validate_intensity(intensity)?;
+        validate_duration(duration_ms)?;
+        let shockers = available_shockers(group)?;
+        let mut worker = self.worker.lock().map_err(|_| Error::Disconnected)?;
+        let commands = shockers
+            .iter()
+            .map(|shocker| shock_command(&shocker.id, intensity, duration_ms))
+            .collect();
+        worker.invoke(commands)
     }
 
     pub fn disconnect(&self) -> Result<(), Error> {
@@ -224,16 +231,16 @@ impl OpenShockClient {
 
 impl Drop for OpenShockClient {
     fn drop(&mut self) {
-        if let Ok(mut worker) = self.worker.lock() {
-            if let Some(mut socket) = worker.socket.take() {
-                let _ = socket.close(None);
-            }
+        if let Ok(mut worker) = self.worker.lock()
+            && let Some(mut socket) = worker.socket.take()
+        {
+            let _ = socket.close(None);
         }
     }
 }
 
 impl Worker {
-    fn invoke_sound(&mut self, commands: Vec<Value>) -> Result<(), Error> {
+    fn invoke(&mut self, commands: Vec<Value>) -> Result<(), Error> {
         let invocation = self.next_invocation.to_string();
         self.next_invocation = self.next_invocation.saturating_add(1);
         let payload = invocation_payload(&invocation, commands, &self.sender);
@@ -256,6 +263,7 @@ impl Worker {
         }
         result
     }
+
     fn send_and_wait(&mut self, invocation: &str, payload: &Value) -> Result<(), Error> {
         let socket = self.socket.as_mut().ok_or(Error::Disconnected)?;
         let mut frame = serde_json::to_string(payload).map_err(|_| Error::Decode {
@@ -450,12 +458,31 @@ fn open_socket(credentials: &Credentials, endpoints: &Endpoints) -> Result<Socke
         }
     }
 }
+fn validate_intensity(intensity: u8) -> Result<(), Error> {
+    if (1..=100).contains(&intensity) {
+        Ok(())
+    } else {
+        Err(Error::InvalidIntensity)
+    }
+}
 
 fn validate_duration(duration_ms: u64) -> Result<(), Error> {
     if (MIN_DURATION_MS..=MAX_DURATION_MS).contains(&duration_ms) {
         Ok(())
     } else {
         Err(Error::InvalidDuration)
+    }
+}
+fn available_shockers(group: &DeviceGroup) -> Result<Vec<&Shocker>, Error> {
+    let shockers: Vec<&Shocker> = group
+        .shockers
+        .iter()
+        .filter(|shocker| !shocker.paused)
+        .collect();
+    if shockers.is_empty() {
+        Err(Error::NoAvailableShockers)
+    } else {
+        Ok(shockers)
     }
 }
 
@@ -573,8 +600,16 @@ fn decode_groups(value: Value) -> Result<Vec<DeviceGroup>, Error> {
     Ok(groups)
 }
 
+fn signal_command(id: &str, signal_type: u8, intensity: u8, duration_ms: u64) -> Value {
+    json!({"id": id, "type": signal_type, "intensity": intensity, "duration": duration_ms, "exclusive": false})
+}
+
 fn sound_command(id: &str, duration_ms: u64) -> Value {
-    json!({"id": id, "type": 3, "intensity": 0, "duration": duration_ms, "exclusive": false})
+    signal_command(id, 3, 0, duration_ms)
+}
+
+fn shock_command(id: &str, intensity: u8, duration_ms: u64) -> Value {
+    signal_command(id, 1, intensity, duration_ms)
 }
 
 fn invocation_payload(invocation: &str, commands: Vec<Value>, sender: &str) -> Value {
@@ -624,6 +659,13 @@ mod tests {
         assert!(!debug.contains("secret-token"));
         assert!(debug.contains("REDACTED"));
     }
+    #[test]
+    fn command_error_redacts_token() {
+        assert_eq!(
+            redact(&format!("token {TOKEN} rejected"), TOKEN),
+            "token [REDACTED] rejected"
+        );
+    }
 
     #[test]
     fn duration_boundaries_are_validated() {
@@ -631,6 +673,108 @@ mod tests {
         assert!(validate_duration(65_535).is_ok());
         assert_eq!(validate_duration(299), Err(Error::InvalidDuration));
         assert_eq!(validate_duration(65_536), Err(Error::InvalidDuration));
+    }
+    #[test]
+    fn intensity_boundaries_are_validated() {
+        assert!(validate_intensity(1).is_ok());
+        assert!(validate_intensity(100).is_ok());
+        assert_eq!(validate_intensity(0), Err(Error::InvalidIntensity));
+    }
+
+    #[test]
+    fn shock_command_has_exact_control_v2_shape() {
+        assert_eq!(
+            shock_command("shocker", 42, 1_234),
+            json!({
+                "id": "shocker",
+                "type": 1,
+                "intensity": 42,
+                "duration": 1_234,
+                "exclusive": false
+            })
+        );
+    }
+
+    #[test]
+    fn available_shockers_filter_paused_targets_and_reject_empty_groups() {
+        let group = DeviceGroup {
+            id: "group".to_owned(),
+            name: "Group".to_owned(),
+            shockers: vec![
+                Shocker {
+                    id: "active".to_owned(),
+                    name: "Active".to_owned(),
+                    paused: false,
+                },
+                Shocker {
+                    id: "paused".to_owned(),
+                    name: "Paused".to_owned(),
+                    paused: true,
+                },
+            ],
+        };
+        let available = available_shockers(&group).expect("active shocker");
+        assert_eq!(
+            available
+                .iter()
+                .map(|shocker| shocker.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["active"]
+        );
+        let empty = DeviceGroup {
+            id: "empty".to_owned(),
+            name: "Empty".to_owned(),
+            shockers: vec![Shocker {
+                id: "paused".to_owned(),
+                name: "Paused".to_owned(),
+                paused: true,
+            }],
+        };
+        assert_eq!(available_shockers(&empty), Err(Error::NoAvailableShockers));
+    }
+
+    #[test]
+    fn shock_validates_before_socket_invocation() {
+        let client = OpenShockClient {
+            http: build_http_client().expect("http client"),
+            credentials: Credentials::new(TOKEN),
+            endpoints: Endpoints::production(),
+            worker: Arc::new(Mutex::new(Worker {
+                socket: None,
+                credentials: Credentials::new(TOKEN),
+                sender: SENDER.to_owned(),
+                endpoints: Endpoints::production(),
+                next_invocation: 1,
+            })),
+        };
+        let active = DeviceGroup {
+            id: "group".to_owned(),
+            name: "Group".to_owned(),
+            shockers: vec![Shocker {
+                id: "active".to_owned(),
+                name: "Active".to_owned(),
+                paused: false,
+            }],
+        };
+        assert_eq!(
+            client.shock(&active, 0, 1_000),
+            Err(Error::InvalidIntensity)
+        );
+        assert_eq!(client.shock(&active, 50, 299), Err(Error::InvalidDuration));
+        let paused = DeviceGroup {
+            id: "paused".to_owned(),
+            name: "Paused".to_owned(),
+            shockers: vec![Shocker {
+                id: "paused".to_owned(),
+                name: "Paused".to_owned(),
+                paused: true,
+            }],
+        };
+        assert_eq!(
+            client.shock(&paused, 50, 1_000),
+            Err(Error::NoAvailableShockers)
+        );
+        assert!(client.worker.lock().expect("worker lock").socket.is_none());
     }
 
     #[test]
@@ -706,6 +850,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::result_large_err)]
     fn client_authenticates_discovers_and_sends_exact_signalr_invocation() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind websocket server");
         let address = listener.local_addr().expect("websocket address");
@@ -788,9 +933,7 @@ mod tests {
         )
         .expect("connect OpenShock client");
         let groups = client.list_devices().expect("discover devices");
-        client
-            .test_sound(&groups[0], 1_000)
-            .expect("send test sound");
+        client.shock(&groups[0], 42, 1_000).expect("send shock");
         client.disconnect().expect("disconnect OpenShock client");
 
         let invocation = websocket.join().expect("join websocket server");
@@ -801,8 +944,8 @@ mod tests {
             invocation["arguments"][0],
             json!([{
                 "id": "active",
-                "type": 3,
-                "intensity": 0,
+                "type": 1,
+                "intensity": 42,
                 "duration": 1_000,
                 "exclusive": false
             }])
@@ -870,7 +1013,7 @@ mod tests {
             }],
         };
 
-        assert_eq!(client.test_sound(&group, 1_000), Err(Error::Transport));
+        assert_eq!(client.shock(&group, 42, 1_000), Err(Error::Transport));
         client.disconnect().expect("disconnect reconnected client");
         let invocation = websocket.join().expect("join websocket server");
         assert_eq!(invocation["arguments"][0].as_array().map(Vec::len), Some(1));
