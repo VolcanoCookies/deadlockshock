@@ -1,23 +1,29 @@
-//! A small synchronous client for PiShock's current discovery APIs and legacy
-//! share-code API.
+//! Synchronous clients for PiShock's WebSocket and legacy API surfaces.
 //!
-//! A [`Device`] is a PiShock hub and contains its owned [`Shocker`]s. Legacy
-//! information and commands instead address a shocker through a share code.
-//! Every client method blocks the calling thread; GUI applications should call
-//! it away from the UI thread.
+//! [`WebSocketClient`] authenticates an account, discovers its owned [`Device`]s,
+//! and commands their paired [`Shocker`]s through the WebSocket API.
+//! [`LegacyClient`] addresses one shocker through a share code. A share code is a
+//! command target, not a replacement for account credentials. Every client
+//! method blocks the calling thread, so GUI applications should call it away
+//! from the UI thread.
 //!
 //! # Example
 //!
 //! ```no_run
-//! use pishock::{Credentials, PiShockClient};
+//! use pishock::{Credentials, LegacyClient, WebSocketClient};
 //!
 //! let credentials = Credentials::new("username", "api-key");
-//! let client = PiShockClient::connect(credentials, "deadlockshock-companion")?;
-//! let devices = client.list_devices()?;
+//! let account = WebSocketClient::connect(
+//!     credentials.clone(),
+//!     "deadlockshock-companion",
+//! )?;
+//! let devices = account.list_devices()?;
 //! if let Some(device) = devices.first() {
-//!     println!("{} has {} shockers", device.name, device.shockers.len());
+//!     account.beep_device(device, 1)?;
 //! }
-//! client.beep("share-code", 1)?;
+//!
+//! let legacy = LegacyClient::new(credentials, "deadlockshock-companion")?;
+//! legacy.beep("share-code", 1)?;
 //! # Ok::<(), pishock::Error>(())
 //! ```
 
@@ -26,25 +32,29 @@ use std::time::Duration;
 
 use reqwest::StatusCode;
 use reqwest::blocking::{Client, Response};
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+pub mod legacy;
+pub mod websocket;
+
+pub use legacy::LegacyClient;
+pub use websocket::WebSocketClient;
+
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_DURATION: u8 = 15;
-const OPERATION_SUCCEEDED: &str = "Operation Succeeded.";
 
 /// A PiShock username and API key.
 ///
 /// Debug formatting always redacts the API key.
 #[derive(Clone)]
 pub struct Credentials {
-    username: String,
-    api_key: String,
+    pub(crate) username: String,
+    pub(crate) api_key: String,
 }
 
 impl Credentials {
-    /// Creates credentials. Values are validated by [`PiShockClient::connect`].
+    /// Creates credentials. Values are validated when constructing either client.
     pub fn new(username: impl Into<String>, api_key: impl Into<String>) -> Self {
         Self {
             username: username.into(),
@@ -108,7 +118,7 @@ pub struct ShockerInfo {
     pub online: Option<bool>,
 }
 
-/// An operation sent to a shocker through a share code.
+/// An operation sent to a shocker through a legacy share code.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Command {
     /// Shock at `intensity` for `duration` seconds.
@@ -122,7 +132,7 @@ pub enum Command {
 /// An error produced by validation or a PiShock API request.
 ///
 /// Transport and decoding errors intentionally omit request URLs so API keys
-/// embedded in PiShock query strings cannot be exposed through formatting.
+/// embedded in query strings cannot be exposed through formatting.
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum Error {
     /// The username was empty.
@@ -167,6 +177,9 @@ pub enum Error {
     /// The share code does not allow the selected operation.
     #[error("the share code does not allow this operation")]
     OperationNotAllowed,
+    /// The selected hub has no unpaused shockers to command.
+    #[error("the selected PiShock hub has no available shockers")]
+    NoAvailableShockers,
     /// PiShock rejected the requested intensity against share limits.
     #[error("PiShock rejected the intensity: {message}")]
     IntensityRejected {
@@ -179,10 +192,16 @@ pub enum Error {
         /// The rejection returned by PiShock.
         message: String,
     },
-    /// PiShock returned an otherwise unknown operation rejection.
+    /// PiShock returned an otherwise unknown legacy operation rejection.
     #[error("PiShock rejected the operation: {message}")]
     OperationRejected {
         /// The trimmed rejection returned by PiShock.
+        message: String,
+    },
+    /// The WebSocket API rejected an owned-device command.
+    #[error("PiShock rejected the device command: {message}")]
+    WebSocketRejected {
+        /// The rejection returned by PiShock, with the API key redacted.
         message: String,
     },
     /// A server returned a non-success HTTP status.
@@ -196,7 +215,7 @@ pub enum Error {
     /// A request could not be sent or its response could not be read.
     #[error("PiShock transport error")]
     Transport,
-    /// A successful HTTP response did not match PiShock's documented schema.
+    /// A successful response did not match PiShock's documented schema.
     #[error("invalid PiShock response for {operation}")]
     Decode {
         /// The operation whose response could not be decoded.
@@ -204,171 +223,16 @@ pub enum Error {
     },
 }
 
-/// A connected, blocking PiShock API client.
-///
-/// The connection authenticates the API key once and stores the resulting user
-/// ID. Requests use finite connect and total timeouts and never retry commands.
-pub struct PiShockClient {
-    http: Client,
-    credentials: Credentials,
-    sender: String,
-    user_id: u64,
-    urls: BaseUrls,
+pub(crate) fn build_http_client() -> Result<Client, Error> {
+    Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(REQUEST_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|_| Error::Transport)
 }
 
-impl PiShockClient {
-    /// Validates credentials and sender name, authenticates, and extracts the user ID.
-    pub fn connect(
-        credentials: Credentials,
-        sender_name: impl Into<String>,
-    ) -> Result<Self, Error> {
-        Self::connect_to(credentials, sender_name.into(), BaseUrls::production())
-    }
-
-    fn connect_to(credentials: Credentials, sender: String, urls: BaseUrls) -> Result<Self, Error> {
-        validate_credentials(&credentials, &sender)?;
-
-        let http = Client::builder()
-            .connect_timeout(CONNECT_TIMEOUT)
-            .timeout(REQUEST_TIMEOUT)
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|_| Error::Transport)?;
-
-        let response = http
-            .get(format!("{}/Auth/GetUserIfAPIKeyValid", urls.auth))
-            .query(&[
-                ("apikey", credentials.api_key.as_str()),
-                ("username", credentials.username.as_str()),
-            ])
-            .send()
-            .map_err(|_| Error::Transport)?;
-        let response = expect_status(response, "authentication")?;
-        let auth: AuthResponse = response.json().map_err(|_| Error::Decode {
-            operation: "authentication",
-        })?;
-
-        Ok(Self {
-            http,
-            credentials,
-            sender,
-            user_id: auth.user_id,
-            urls,
-        })
-    }
-
-    /// Lists the authenticated user's owned hubs and their paired shockers.
-    pub fn list_devices(&self) -> Result<Vec<Device>, Error> {
-        let response = self
-            .http
-            .get(format!("{}/PiShock/GetUserDevices", self.urls.platform))
-            .query(&[
-                ("UserId", self.user_id.to_string()),
-                ("Token", self.credentials.api_key.clone()),
-                ("api", "true".to_owned()),
-            ])
-            .send()
-            .map_err(|_| Error::Transport)?;
-        let response = expect_status(response, "device listing")?;
-        let devices: Vec<DeviceResponse> = response.json().map_err(|_| Error::Decode {
-            operation: "device listing",
-        })?;
-        Ok(devices.into_iter().map(Device::from).collect())
-    }
-
-    /// Lists owned hubs and returns the one with `client_id`, if present.
-    pub fn get_device(&self, client_id: u64) -> Result<Option<Device>, Error> {
-        Ok(self
-            .list_devices()?
-            .into_iter()
-            .find(|device| device.client_id == client_id))
-    }
-
-    /// Gets share limits and status for a legacy share code.
-    pub fn get_shocker_info(&self, share_code: &str) -> Result<ShockerInfo, Error> {
-        validate_share_code(share_code)?;
-        let request = ShockerInfoRequest {
-            username: &self.credentials.username,
-            code: share_code,
-            api_key: &self.credentials.api_key,
-        };
-        let response = self
-            .http
-            .post(format!("{}/api/GetShockerInfo", self.urls.legacy))
-            .json(&request)
-            .send()
-            .map_err(|_| Error::Transport)?;
-        let response = expect_shocker_info_status(response)?;
-        let info: ShockerInfoResponse = response.json().map_err(|_| Error::Decode {
-            operation: "shocker information",
-        })?;
-        Ok(info.into())
-    }
-
-    /// Sends one command request to a legacy share-code target.
-    pub fn send_command(&self, share_code: &str, command: Command) -> Result<(), Error> {
-        validate_share_code(share_code)?;
-        validate_command(command)?;
-        let (operation, intensity, duration) = match command {
-            Command::Shock {
-                intensity,
-                duration,
-            } => (0, Some(intensity), duration),
-            Command::Vibrate {
-                intensity,
-                duration,
-            } => (1, Some(intensity), duration),
-            Command::Beep { duration } => (2, None, duration),
-        };
-        let request = OperationRequest {
-            username: &self.credentials.username,
-            name: &self.sender,
-            code: share_code,
-            intensity,
-            duration,
-            api_key: &self.credentials.api_key,
-            operation,
-        };
-        let response = self
-            .http
-            .post(format!("{}/api/apioperate/", self.urls.legacy))
-            .json(&request)
-            .send()
-            .map_err(|_| Error::Transport)?;
-        let response = expect_status(response, "command")?;
-        let body = response.text().map_err(|_| Error::Transport)?;
-        parse_operation_response(body.trim(), &self.credentials.api_key)
-    }
-
-    /// Shocks a share-code target at `intensity` for `duration` seconds.
-    pub fn shock(&self, share_code: &str, intensity: u8, duration: u8) -> Result<(), Error> {
-        self.send_command(
-            share_code,
-            Command::Shock {
-                intensity,
-                duration,
-            },
-        )
-    }
-
-    /// Vibrates a share-code target at `intensity` for `duration` seconds.
-    pub fn vibrate(&self, share_code: &str, intensity: u8, duration: u8) -> Result<(), Error> {
-        self.send_command(
-            share_code,
-            Command::Vibrate {
-                intensity,
-                duration,
-            },
-        )
-    }
-
-    /// Beeps a share-code target for `duration` seconds.
-    pub fn beep(&self, share_code: &str, duration: u8) -> Result<(), Error> {
-        self.send_command(share_code, Command::Beep { duration })
-    }
-}
-
-fn validate_credentials(credentials: &Credentials, sender: &str) -> Result<(), Error> {
+pub(crate) fn validate_credentials(credentials: &Credentials, sender: &str) -> Result<(), Error> {
     if credentials.username.trim().is_empty() {
         return Err(Error::EmptyUsername);
     }
@@ -381,44 +245,18 @@ fn validate_credentials(credentials: &Credentials, sender: &str) -> Result<(), E
     Ok(())
 }
 
-fn validate_share_code(share_code: &str) -> Result<(), Error> {
-    if share_code.trim().is_empty() {
-        Err(Error::EmptyShareCode)
-    } else {
+pub(crate) fn validate_duration(duration: u8) -> Result<(), Error> {
+    if (1..=MAX_DURATION).contains(&duration) {
         Ok(())
+    } else {
+        Err(Error::InvalidDuration)
     }
 }
 
-fn validate_command(command: Command) -> Result<(), Error> {
-    let (intensity, duration) = match command {
-        Command::Shock {
-            intensity,
-            duration,
-        }
-        | Command::Vibrate {
-            intensity,
-            duration,
-        } => (Some(intensity), duration),
-        Command::Beep { duration } => (None, duration),
-    };
-    if intensity.is_some_and(|value| !(1..=100).contains(&value)) {
-        return Err(Error::InvalidIntensity);
-    }
-    if !(1..=MAX_DURATION).contains(&duration) {
-        return Err(Error::InvalidDuration);
-    }
-    Ok(())
-}
-
-fn expect_shocker_info_status(response: Response) -> Result<Response, Error> {
-    match response.status() {
-        StatusCode::NOT_FOUND => Err(Error::ShareCodeNotFound),
-        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(Error::NotAuthorized),
-        _ => expect_status(response, "shocker information"),
-    }
-}
-
-fn expect_status(response: Response, operation: &'static str) -> Result<Response, Error> {
+pub(crate) fn expect_status(
+    response: Response,
+    operation: &'static str,
+) -> Result<Response, Error> {
     let status = response.status();
     if status.is_success() {
         Ok(response)
@@ -434,158 +272,8 @@ fn expect_status(response: Response, operation: &'static str) -> Result<Response
     }
 }
 
-fn parse_operation_response(body: &str, api_key: &str) -> Result<(), Error> {
-    match body {
-        OPERATION_SUCCEEDED => Ok(()),
-        "This code doesn’t exist." | "This code doesn't exist." => Err(Error::ShareCodeNotFound),
-        "Not Authorized." => Err(Error::NotAuthorized),
-        "Shocker is Paused, unable to send command."
-        | "Shocker is Paused or does not exist. Unpause to send command." => {
-            Err(Error::ShockerPaused)
-        }
-        "Device currently not connected." => Err(Error::DeviceOffline),
-        "This share code has already been used by somebody else." | "Device in Use." => {
-            Err(Error::ShareCodeInUse)
-        }
-        "Unknown Op, use 0 for shock, 1 for vibrate and 2 for beep." => {
-            Err(Error::InvalidOperation)
-        }
-        "Shock not allowed." | "Vibrate not allowed." | "Beep not allowed." => {
-            Err(Error::OperationNotAllowed)
-        }
-        message if message.starts_with("Intensity must be between 0 and ") => {
-            Err(Error::IntensityRejected {
-                message: redact_api_key(message, api_key),
-            })
-        }
-        message if message.starts_with("Duration must be between 1 and ") => {
-            Err(Error::DurationRejected {
-                message: redact_api_key(message, api_key),
-            })
-        }
-        message => Err(Error::OperationRejected {
-            message: redact_api_key(message, api_key),
-        }),
-    }
-}
-
-fn redact_api_key(message: &str, api_key: &str) -> String {
+pub(crate) fn redact_api_key(message: &str, api_key: &str) -> String {
     message.replace(api_key, "[REDACTED]")
-}
-
-#[derive(Clone)]
-struct BaseUrls {
-    auth: String,
-    platform: String,
-    legacy: String,
-}
-
-impl BaseUrls {
-    fn production() -> Self {
-        Self {
-            auth: "https://auth.pishock.com".to_owned(),
-            platform: "https://ps.pishock.com".to_owned(),
-            legacy: "https://do.pishock.com".to_owned(),
-        }
-    }
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "PascalCase")]
-struct AuthResponse {
-    #[serde(rename = "UserID", alias = "UserId", alias = "userId")]
-    user_id: u64,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct DeviceResponse {
-    client_id: u64,
-    name: String,
-    user_id: u64,
-    username: String,
-    shockers: Vec<ShockerResponse>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ShockerResponse {
-    name: String,
-    shocker_id: u64,
-    is_paused: bool,
-}
-
-impl From<DeviceResponse> for Device {
-    fn from(value: DeviceResponse) -> Self {
-        Self {
-            client_id: value.client_id,
-            name: value.name,
-            user_id: value.user_id,
-            username: value.username,
-            shockers: value.shockers.into_iter().map(Shocker::from).collect(),
-        }
-    }
-}
-
-impl From<ShockerResponse> for Shocker {
-    fn from(value: ShockerResponse) -> Self {
-        Self {
-            name: value.name,
-            shocker_id: value.shocker_id,
-            is_paused: value.is_paused,
-        }
-    }
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "PascalCase")]
-struct ShockerInfoRequest<'a> {
-    username: &'a str,
-    code: &'a str,
-    #[serde(rename = "Apikey")]
-    api_key: &'a str,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ShockerInfoResponse {
-    client_id: u64,
-    id: u64,
-    name: String,
-    paused: bool,
-    max_intensity: u8,
-    max_duration: u8,
-    #[serde(default, alias = "isOnline")]
-    online: Option<bool>,
-}
-
-impl From<ShockerInfoResponse> for ShockerInfo {
-    fn from(value: ShockerInfoResponse) -> Self {
-        Self {
-            client_id: value.client_id,
-            id: value.id,
-            name: value.name,
-            paused: value.paused,
-            max_intensity: value.max_intensity,
-            max_duration: value.max_duration,
-            online: value.online,
-        }
-    }
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "PascalCase")]
-struct OperationRequest<'a> {
-    username: &'a str,
-    name: &'a str,
-    code: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    intensity: Option<u8>,
-    duration: u8,
-    #[serde(rename = "Apikey")]
-    api_key: &'a str,
-    #[serde(rename = "Op")]
-    operation: u8,
 }
 
 #[cfg(test)]

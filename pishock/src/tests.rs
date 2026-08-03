@@ -1,4 +1,8 @@
+use std::net::TcpListener;
+use std::thread::{self, JoinHandle};
+
 use mockito::{Matcher, Mock, Server};
+use serde_json::{Value, json};
 
 use super::*;
 
@@ -25,20 +29,24 @@ fn auth_mock(server: &mut Server) -> Mock {
         .create()
 }
 
-fn connect(server: &mut Server) -> (PiShockClient, Mock) {
+fn websocket_client(server: &mut Server) -> (WebSocketClient, Mock) {
     let authentication = auth_mock(server);
     let url = server.url();
-    let client = PiShockClient::connect_to(
+    let client = WebSocketClient::connect_to(
         credentials(),
         SENDER.into(),
-        BaseUrls {
+        websocket::WebSocketUrls {
             auth: url.clone(),
             platform: url.clone(),
-            legacy: url,
+            websocket: url,
         },
     )
     .unwrap();
     (client, authentication)
+}
+
+fn legacy_client(server: &Server) -> LegacyClient {
+    LegacyClient::new_to(credentials(), SENDER.into(), server.url()).unwrap()
 }
 
 fn operation_mock(server: &mut Server, body: &str, response: &str) -> Mock {
@@ -53,6 +61,36 @@ fn operation_mock(server: &mut Server, body: &str, response: &str) -> Mock {
         .create()
 }
 
+fn start_websocket_server(response: impl Into<String>) -> (String, JoinHandle<Value>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let response = response.into();
+    let handle = thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut socket = tungstenite::accept(stream).unwrap();
+        let message = socket.read().unwrap();
+        let tungstenite::Message::Text(body) = message else {
+            panic!("expected text command");
+        };
+        let payload = serde_json::from_str(body.as_str()).unwrap();
+        socket
+            .send(tungstenite::Message::Text(response.into()))
+            .unwrap();
+        payload
+    });
+    (format!("ws://{address}/v2"), handle)
+}
+
+fn owned_device(shockers: Vec<Shocker>) -> Device {
+    Device {
+        client_id: 7,
+        name: "Hub".into(),
+        user_id: 42,
+        username: USERNAME.into(),
+        shockers,
+    }
+}
+
 #[test]
 fn credentials_debug_redacts_api_key() {
     let rendered = format!("{:?}", credentials());
@@ -61,9 +99,26 @@ fn credentials_debug_redacts_api_key() {
 }
 
 #[test]
+fn legacy_client_validates_credentials_when_constructed() {
+    assert_eq!(
+        LegacyClient::new(Credentials::new("", API_KEY), SENDER).err(),
+        Some(Error::EmptyUsername)
+    );
+    assert_eq!(
+        LegacyClient::new(Credentials::new(USERNAME, " "), SENDER).err(),
+        Some(Error::EmptyApiKey)
+    );
+    assert_eq!(
+        LegacyClient::new(credentials(), "\t").err(),
+        Some(Error::EmptySender)
+    );
+    assert!(LegacyClient::new(credentials(), SENDER).is_ok());
+}
+
+#[test]
 fn connect_and_list_devices_obey_discovery_contracts() {
     let mut server = Server::new();
-    let (client, authentication) = connect(&mut server);
+    let (client, authentication) = websocket_client(&mut server);
     authentication.assert();
     let listing = server
         .mock("GET", "/PiShock/GetUserDevices")
@@ -88,7 +143,7 @@ fn connect_and_list_devices_obey_discovery_contracts() {
 #[test]
 fn get_device_lists_and_selects_by_client_id() {
     let mut server = Server::new();
-    let (client, _authentication) = connect(&mut server);
+    let (client, _authentication) = websocket_client(&mut server);
     let listing = server
         .mock("GET", "/PiShock/GetUserDevices")
         .match_query(Matcher::AllOf(vec![
@@ -110,7 +165,7 @@ fn get_device_lists_and_selects_by_client_id() {
 #[test]
 fn get_shocker_info_uses_pascal_request_and_parses_camel_response() {
     let mut server = Server::new();
-    let (client, _authentication) = connect(&mut server);
+    let client = legacy_client(&server);
     let info_request = server
         .mock("POST", "/api/GetShockerInfo")
         .match_header("content-type", Matcher::Regex("^application/json".into()))
@@ -146,7 +201,7 @@ fn get_shocker_info_maps_not_found_and_authorization_statuses() {
         (403, Error::NotAuthorized),
     ] {
         let mut server = Server::new();
-        let (client, _authentication) = connect(&mut server);
+        let client = legacy_client(&server);
         let response = server
             .mock("POST", "/api/GetShockerInfo")
             .with_status(status)
@@ -161,7 +216,7 @@ fn get_shocker_info_maps_not_found_and_authorization_statuses() {
 #[test]
 fn convenience_commands_emit_exact_operation_payloads() {
     let mut server = Server::new();
-    let (client, _authentication) = connect(&mut server);
+    let client = legacy_client(&server);
 
     let shock = operation_mock(
         &mut server,
@@ -197,15 +252,131 @@ fn convenience_commands_emit_exact_operation_payloads() {
 }
 
 #[test]
-fn unified_command_path_sends_the_selected_command() {
+fn beep_device_publishes_to_every_unpaused_shocker() {
+    let (websocket_url, websocket_server) = start_websocket_server(
+        r#"{"ErrorCode":null,"IsError":false,"Message":"Publish successful.","OriginalCommand":"PUBLISH"}"#,
+    );
     let mut server = Server::new();
-    let (client, _authentication) = connect(&mut server);
+    let (mut client, _authentication) = websocket_client(&mut server);
+    client.urls.websocket = websocket_url;
+    let device = owned_device(vec![
+        Shocker {
+            name: "One".into(),
+            shocker_id: 9,
+            is_paused: false,
+        },
+        Shocker {
+            name: "Paused".into(),
+            shocker_id: 10,
+            is_paused: true,
+        },
+        Shocker {
+            name: "Two".into(),
+            shocker_id: 11,
+            is_paused: false,
+        },
+    ]);
+
+    client.beep_device(&device, 2).unwrap();
+
+    assert_eq!(
+        websocket_server.join().unwrap(),
+        json!({
+            "Operation": "PUBLISH",
+            "PublishCommands": [
+                {
+                    "Target": "c7-ops",
+                    "Body": {
+                        "id": 9,
+                        "m": "b",
+                        "i": 0,
+                        "d": 2000,
+                        "r": true,
+                        "l": {
+                            "u": 42,
+                            "ty": "api",
+                            "w": false,
+                            "h": false,
+                            "o": SENDER
+                        }
+                    }
+                },
+                {
+                    "Target": "c7-ops",
+                    "Body": {
+                        "id": 11,
+                        "m": "b",
+                        "i": 0,
+                        "d": 2000,
+                        "r": true,
+                        "l": {
+                            "u": 42,
+                            "ty": "api",
+                            "w": false,
+                            "h": false,
+                            "o": SENDER
+                        }
+                    }
+                }
+            ]
+        })
+    );
+}
+
+#[test]
+fn beep_device_validates_duration_and_available_shockers() {
+    let mut server = Server::new();
+    let (client, _authentication) = websocket_client(&mut server);
+    let active = owned_device(vec![Shocker {
+        name: "Active".into(),
+        shocker_id: 9,
+        is_paused: false,
+    }]);
+    let paused = owned_device(vec![Shocker {
+        name: "Paused".into(),
+        shocker_id: 10,
+        is_paused: true,
+    }]);
+
+    assert_eq!(client.beep_device(&active, 0), Err(Error::InvalidDuration));
+    assert_eq!(
+        client.beep_device(&paused, 1),
+        Err(Error::NoAvailableShockers)
+    );
+}
+
+#[test]
+fn beep_device_redacts_api_keys_from_websocket_rejections() {
+    let response = format!(
+        r#"{{"ErrorCode":"Rejected","IsError":true,"Message":"command rejected for {API_KEY}","OriginalCommand":"PUBLISH"}}"#
+    );
+    let (websocket_url, websocket_server) = start_websocket_server(response);
+    let mut server = Server::new();
+    let (mut client, _authentication) = websocket_client(&mut server);
+    client.urls.websocket = websocket_url;
+    let device = owned_device(vec![Shocker {
+        name: "Active".into(),
+        shocker_id: 9,
+        is_paused: false,
+    }]);
+
+    let error = client.beep_device(&device, 1).unwrap_err();
+
+    websocket_server.join().unwrap();
+    assert!(matches!(error, Error::WebSocketRejected { .. }));
+    assert!(!format!("{error:?} {error}").contains(API_KEY));
+}
+
+#[test]
+fn legacy_command_path_sends_the_selected_command() {
+    let mut server = Server::new();
+    let client = legacy_client(&server);
     let request = operation_mock(
         &mut server,
         &format!(
             r#"{{"Username":"{USERNAME}","Name":"{SENDER}","Code":"{SHARE_CODE}","Intensity":1,"Duration":15,"Apikey":"{API_KEY}","Op":0}}"#
         ),
-        OPERATION_SUCCEEDED,
+        legacy::OPERATION_SUCCEEDED,
     );
 
     client
@@ -223,7 +394,7 @@ fn unified_command_path_sends_the_selected_command() {
 #[test]
 fn invalid_values_are_rejected_without_networking() {
     let mut server = Server::new();
-    let (client, _authentication) = connect(&mut server);
+    let client = legacy_client(&server);
     let no_operation = server.mock("POST", "/api/apioperate/").expect(0).create();
     let no_info = server
         .mock("POST", "/api/GetShockerInfo")
@@ -262,13 +433,13 @@ fn credentials_are_validated_before_authentication_networking() {
             .expect(0)
             .create();
         let url = server.url();
-        let result = PiShockClient::connect_to(
+        let result = WebSocketClient::connect_to(
             credentials,
             sender.into(),
-            BaseUrls {
+            websocket::WebSocketUrls {
                 auth: url.clone(),
                 platform: url.clone(),
-                legacy: url,
+                websocket: url,
             },
         );
         assert_eq!(result.err(), Some(expected));
@@ -298,7 +469,7 @@ fn documented_operation_rejections_map_to_typed_errors() {
 
     for (body, expected) in cases {
         let mut server = Server::new();
-        let (client, _authentication) = connect(&mut server);
+        let client = legacy_client(&server);
         let rejection = operation_mock(
             &mut server,
             &format!(
@@ -314,33 +485,33 @@ fn documented_operation_rejections_map_to_typed_errors() {
 #[test]
 fn bounded_live_and_unknown_rejections_are_preserved() {
     assert_eq!(
-        parse_operation_response("Intensity must be between 0 and 50", API_KEY),
+        legacy::parse_operation_response("Intensity must be between 0 and 50", API_KEY),
         Err(Error::IntensityRejected {
             message: "Intensity must be between 0 and 50".into()
         })
     );
     assert_eq!(
-        parse_operation_response("Duration must be between 1 and 8", API_KEY),
+        legacy::parse_operation_response("Duration must be between 1 and 8", API_KEY),
         Err(Error::DurationRejected {
             message: "Duration must be between 1 and 8".into()
         })
     );
     assert_eq!(
-        parse_operation_response("Unexpected policy rejection", API_KEY),
+        legacy::parse_operation_response("Unexpected policy rejection", API_KEY),
         Err(Error::OperationRejected {
             message: "Unexpected policy rejection".into()
         })
     );
     assert_eq!(
-        parse_operation_response("Shock not allowed.", API_KEY),
+        legacy::parse_operation_response("Shock not allowed.", API_KEY),
         Err(Error::OperationNotAllowed)
     );
     assert_eq!(
-        parse_operation_response("Device in Use.", API_KEY),
+        legacy::parse_operation_response("Device in Use.", API_KEY),
         Err(Error::ShareCodeInUse)
     );
     assert_eq!(
-        parse_operation_response(&format!("Rejected key {API_KEY}"), API_KEY),
+        legacy::parse_operation_response(&format!("Rejected key {API_KEY}"), API_KEY),
         Err(Error::OperationRejected {
             message: "Rejected key [REDACTED]".into()
         })
@@ -350,7 +521,7 @@ fn bounded_live_and_unknown_rejections_are_preserved() {
 #[test]
 fn a_rejected_command_is_sent_exactly_once() {
     let mut server = Server::new();
-    let (client, _authentication) = connect(&mut server);
+    let client = legacy_client(&server);
     let rejection = operation_mock(
         &mut server,
         &format!(
@@ -376,13 +547,13 @@ fn http_and_decode_failures_are_typed_and_redacted() {
         .expect(1)
         .create();
     let status_url = status_server.url();
-    let error = PiShockClient::connect_to(
+    let error = WebSocketClient::connect_to(
         credentials(),
         SENDER.into(),
-        BaseUrls {
+        websocket::WebSocketUrls {
             auth: status_url.clone(),
             platform: status_url.clone(),
-            legacy: status_url,
+            websocket: status_url,
         },
     )
     .err()
@@ -404,13 +575,13 @@ fn http_and_decode_failures_are_typed_and_redacted() {
         .expect(1)
         .create();
     let decode_url = decode_server.url();
-    let error = PiShockClient::connect_to(
+    let error = WebSocketClient::connect_to(
         credentials(),
         SENDER.into(),
-        BaseUrls {
+        websocket::WebSocketUrls {
             auth: decode_url.clone(),
             platform: decode_url.clone(),
-            legacy: decode_url,
+            websocket: decode_url,
         },
     )
     .err()

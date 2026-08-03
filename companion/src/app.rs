@@ -1,10 +1,11 @@
 use std::ops::RangeInclusive;
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 
 use crate::deadlock_path::{self, Detection, DetectionError};
 use egui::{Color32, TextEdit, Ui};
-use pishock::{Credentials, Device, Error as PiShockError, PiShockClient};
+use pishock::{Credentials, Device, Error as PiShockError, WebSocketClient};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum CredentialState {
@@ -100,11 +101,38 @@ impl LogDetectionStatus {
     }
 }
 
-type ConnectionResult = Result<Vec<Device>, PiShockError>;
+type ConnectionResult = Result<(WebSocketClient, Vec<Device>), PiShockError>;
+type BeepResult = Result<(), PiShockError>;
 
 const SENDER_NAME: &str = "deadlockshock-companion";
+const TEST_BEEP_DURATION_SECONDS: u8 = 1;
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum BeepStatus {
+    Sending,
+    Sent,
+    Failed(String),
+}
+
+impl BeepStatus {
+    fn label(&self) -> &str {
+        match self {
+            Self::Sending => "Sending beep…",
+            Self::Sent => "Beep sent.",
+            Self::Failed(message) => message,
+        }
+    }
+
+    fn color(&self) -> [f32; 4] {
+        match self {
+            Self::Sending => [0.65, 0.65, 0.65, 1.0],
+            Self::Sent => [0.30, 0.78, 0.42, 1.0],
+            Self::Failed(_) => [0.92, 0.32, 0.28, 1.0],
+        }
+    }
+}
+
+#[derive(Default)]
 pub struct AppState {
     pub api_key: String,
     pub username: String,
@@ -120,8 +148,11 @@ pub struct AppState {
     pub duration: f32,
     pub log_path: String,
     pub listening_state: ListeningState,
+    client: Option<Arc<WebSocketClient>>,
     connection_error: Option<String>,
     connection_result: Option<Receiver<ConnectionResult>>,
+    beep_result: Option<Receiver<BeepResult>>,
+    beep_status: Option<BeepStatus>,
     log_detection_status: Option<LogDetectionStatus>,
 }
 
@@ -143,9 +174,12 @@ impl AppState {
 
     fn reset_connection(&mut self) {
         self.credential_state = CredentialState::Unknown;
+        self.client = None;
         self.devices.clear();
         self.selected_device = None;
         self.connection_error = None;
+        self.beep_result = None;
+        self.beep_status = None;
     }
 
     fn start_connection_test(&mut self, context: egui::Context) {
@@ -160,8 +194,10 @@ impl AppState {
         self.connection_result = Some(receiver);
 
         thread::spawn(move || {
-            let result = PiShockClient::connect(credentials, SENDER_NAME)
-                .and_then(|client| client.list_devices());
+            let result = WebSocketClient::connect(credentials, SENDER_NAME).and_then(|client| {
+                let devices = client.list_devices()?;
+                Ok((client, devices))
+            });
             let _ = sender.send(result);
             context.request_repaint();
         });
@@ -187,22 +223,78 @@ impl AppState {
 
     fn apply_connection_result(&mut self, result: ConnectionResult) {
         match result {
-            Ok(devices) => {
-                self.selected_device = self
-                    .selected_device
-                    .filter(|selected| devices.iter().any(|device| device.client_id == *selected))
-                    .or_else(|| devices.first().map(|device| device.client_id));
-                self.devices = devices;
-                self.credential_state = CredentialState::Valid;
-                self.connection_error = None;
+            Ok((client, devices)) => {
+                self.client = Some(Arc::new(client));
+                self.apply_devices(devices);
             }
             Err(error) => {
+                self.client = None;
+                self.beep_result = None;
+                self.beep_status = None;
                 self.devices.clear();
                 self.selected_device = None;
                 self.credential_state = CredentialState::Invalid;
                 self.connection_error = Some(error.to_string());
             }
         }
+    }
+
+    fn apply_devices(&mut self, devices: Vec<Device>) {
+        self.selected_device = self
+            .selected_device
+            .filter(|selected| devices.iter().any(|device| device.client_id == *selected))
+            .or_else(|| devices.first().map(|device| device.client_id));
+        self.devices = devices;
+        self.credential_state = CredentialState::Valid;
+        self.beep_status = None;
+        self.connection_error = None;
+    }
+
+    fn beep_in_progress(&self) -> bool {
+        self.beep_result.is_some()
+    }
+
+    fn start_beep(&mut self, context: egui::Context) {
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        let Some(device) = self.selected_device().cloned() else {
+            return;
+        };
+        let (sender, receiver) = mpsc::channel();
+
+        self.beep_status = Some(BeepStatus::Sending);
+        self.beep_result = Some(receiver);
+        thread::spawn(move || {
+            let result = client.beep_device(&device, TEST_BEEP_DURATION_SECONDS);
+            let _ = sender.send(result);
+            context.request_repaint();
+        });
+    }
+
+    fn poll_beep(&mut self) {
+        let Some(receiver) = &self.beep_result else {
+            return;
+        };
+
+        match receiver.try_recv() {
+            Ok(result) => {
+                self.beep_result = None;
+                self.apply_beep_result(result);
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                self.beep_result = None;
+                self.apply_beep_result(Err(PiShockError::Transport));
+            }
+        }
+    }
+
+    fn apply_beep_result(&mut self, result: BeepResult) {
+        self.beep_status = Some(match result {
+            Ok(()) => BeepStatus::Sent,
+            Err(error) => BeepStatus::Failed(format!("Beep failed: {error}")),
+        });
     }
 
     fn auto_detect_log_path(&mut self) {
@@ -228,11 +320,13 @@ impl AppState {
     }
 
     pub fn draw(&mut self, ui: &mut Ui) {
+        self.poll_beep();
         self.poll_connection_test();
 
         ui.heading("Credentials");
+        let busy = self.connection_in_progress() || self.beep_in_progress();
         let mut credentials_changed = false;
-        ui.add_enabled_ui(!self.connection_in_progress(), |ui| {
+        ui.add_enabled_ui(!busy, |ui| {
             credentials_changed |= text_input(ui, "API key", &mut self.api_key, true);
             credentials_changed |= text_input(ui, "Username", &mut self.username, false);
         });
@@ -240,7 +334,7 @@ impl AppState {
             self.reset_connection();
         }
 
-        let can_test = self.credentials_present() && !self.connection_in_progress();
+        let can_test = self.credentials_present() && !busy;
         if ui
             .add_enabled(
                 can_test,
@@ -264,7 +358,8 @@ impl AppState {
         ui.add_space(8.0);
 
         ui.heading("Device");
-        let device_selection_enabled = !self.devices.is_empty() && !self.connection_in_progress();
+        let device_selection_enabled =
+            !self.devices.is_empty() && !self.connection_in_progress() && !self.beep_in_progress();
         let devices = &self.devices;
         let selected_name = self
             .selected_device
@@ -277,6 +372,7 @@ impl AppState {
                     "Select a device"
                 }
             });
+        let mut selection_changed = false;
         let selected_device = &mut self.selected_device;
         ui.add_enabled_ui(device_selection_enabled, |ui| {
             egui::ComboBox::from_id_salt("device")
@@ -284,14 +380,35 @@ impl AppState {
                 .width(ui.available_width())
                 .show_ui(ui, |ui| {
                     for device in devices {
-                        ui.selectable_value(
-                            selected_device,
-                            Some(device.client_id),
-                            device.name.as_str(),
-                        );
+                        selection_changed |= ui
+                            .selectable_value(
+                                selected_device,
+                                Some(device.client_id),
+                                device.name.as_str(),
+                            )
+                            .changed();
                     }
                 });
         });
+        if selection_changed {
+            self.beep_status = None;
+        }
+        let can_beep = self.selected_device.is_some()
+            && self.client.is_some()
+            && !self.connection_in_progress()
+            && !self.beep_in_progress();
+        if ui
+            .add_enabled(
+                can_beep,
+                egui::Button::new("Send beep").min_size([ui.available_width(), 0.0].into()),
+            )
+            .clicked()
+        {
+            self.start_beep(ui.ctx().clone());
+        }
+        if let Some(status) = &self.beep_status {
+            status_line(ui, status.label(), status.color());
+        }
 
         ui.add_space(8.0);
         ui.separator();
@@ -483,7 +600,7 @@ mod tests {
             ..AppState::default()
         };
 
-        state.apply_connection_result(Ok(vec![device(1, "Alpha"), device(2, "Beta")]));
+        state.apply_devices(vec![device(1, "Alpha"), device(2, "Beta")]);
 
         assert_eq!(state.credential_state, CredentialState::Valid);
         assert_eq!(state.devices.len(), 2);
@@ -501,7 +618,7 @@ mod tests {
             ..AppState::default()
         };
 
-        state.apply_connection_result(Ok(vec![device(1, "Alpha"), device(2, "Beta")]));
+        state.apply_devices(vec![device(1, "Alpha"), device(2, "Beta")]);
 
         assert_eq!(state.selected_device, Some(1));
     }
@@ -522,6 +639,22 @@ mod tests {
         assert_eq!(
             state.connection_error.as_deref(),
             Some("PiShock authentication was rejected")
+        );
+    }
+
+    #[test]
+    fn beep_result_reports_success_and_failure() {
+        let mut state = AppState::default();
+
+        state.apply_beep_result(Ok(()));
+        assert_eq!(state.beep_status, Some(BeepStatus::Sent));
+
+        state.apply_beep_result(Err(PiShockError::Transport));
+        assert_eq!(
+            state.beep_status,
+            Some(BeepStatus::Failed(
+                "Beep failed: PiShock transport error".to_owned()
+            ))
         );
     }
 
