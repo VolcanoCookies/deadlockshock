@@ -1,14 +1,15 @@
 pub mod app;
+pub mod deadlock_path;
 
 use app::AppState;
 use eframe::egui;
 
 impl eframe::App for AppState {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        egui::Frame::NONE.inner_margin(8.0).show(ui, |ui| {
-            if self.draw(ui) {
-                println!("Connection requested for user {}", self.user_id.trim());
-            }
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            egui::Frame::NONE.inner_margin(8.0).show(ui, |ui| {
+                self.draw(ui);
+            });
         });
     }
 }

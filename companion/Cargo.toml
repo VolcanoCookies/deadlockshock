@@ -6,3 +6,11 @@ edition = "2024"
 [dependencies]
 eframe = { version = "0.35", default-features = false, features = ["default_fonts", "glow", "x11"] }
 egui = "0.35"
+pishock = { path = "../pishock" }
+steamlocate = "2.1"
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.56"
+
+[dev-dependencies]
+tempfile = "3"
