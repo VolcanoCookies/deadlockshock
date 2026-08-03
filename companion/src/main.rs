@@ -1,7 +1,7 @@
 pub mod app;
 pub mod bridge_listener;
 pub mod deadlock_path;
-
+pub mod provider;
 use app::AppState;
 use eframe::egui;
 

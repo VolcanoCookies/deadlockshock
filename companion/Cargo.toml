@@ -7,8 +7,10 @@ edition = "2024"
 eframe = { version = "0.35", default-features = false, features = ["default_fonts", "glow", "x11"] }
 egui = "0.35"
 pishock = { path = "../pishock" }
+openshock = { path = "../openshock" }
 steamlocate = "2.1"
 serde = { version = "1", features = ["derive"] }
+thiserror = "2"
 serde_json = "1"
 
 [target.'cfg(windows)'.dependencies]
