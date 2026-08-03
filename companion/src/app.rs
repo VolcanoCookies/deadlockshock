@@ -3,17 +3,23 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::bridge_listener::{
     BridgeEvent, ConsoleLogListener, ListenerPhase, ListenerStatus, LocalPlayerDeath,
 };
 use crate::deadlock_path::{self, Detection, DetectionError};
+use crate::persistence::{PersistedState, Persistence, default_state_path};
 use crate::provider::{
     ConnectedProvider, ProviderCredentials, ProviderError, ProviderKind, ProviderTarget, TargetId,
 };
 use egui::{Color32, TextEdit, Ui};
 use rand::Rng;
+
+pub const MIN_SHOCK_INTENSITY: f32 = 1.0;
+pub const MAX_SHOCK_INTENSITY: f32 = 100.0;
+pub const MIN_SHOCK_DURATION: f32 = 0.3;
+pub const MAX_SHOCK_DURATION: f32 = 3.0;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum CredentialState {
@@ -235,6 +241,7 @@ pub struct AppState {
     pub credential_state: CredentialState,
     pub devices: Vec<ProviderTarget>,
     pub selected_device: Option<TargetId>,
+    pub preferred_target: Option<TargetId>,
     pub shock_mode: ShockMode,
     pub min_intensity: f32,
     pub max_intensity: f32,
@@ -271,13 +278,14 @@ impl Default for AppState {
             credential_state: CredentialState::default(),
             devices: Vec::new(),
             selected_device: None,
+            preferred_target: None,
             shock_mode: ShockMode::default(),
-            min_intensity: 1.0,
-            max_intensity: 1.0,
-            intensity: 1.0,
-            min_duration: 0.3,
-            max_duration: 0.3,
-            duration: 0.3,
+            min_intensity: MIN_SHOCK_INTENSITY,
+            max_intensity: MIN_SHOCK_INTENSITY,
+            intensity: MIN_SHOCK_INTENSITY,
+            min_duration: MIN_SHOCK_DURATION,
+            max_duration: MIN_SHOCK_DURATION,
+            duration: MIN_SHOCK_DURATION,
             log_path: String::new(),
             client: None,
             connection_error: None,
@@ -327,6 +335,54 @@ impl AppState {
     fn shock_in_progress(&self) -> bool {
         self.shock_in_flight != 0
     }
+    pub(crate) fn is_busy(&self) -> bool {
+        self.connection_in_progress() || self.sound_in_progress() || self.shock_in_progress()
+    }
+    pub(crate) fn reset_saved_state(&mut self) -> bool {
+        if self.is_busy() {
+            return false;
+        }
+
+        self.bridge_listener.stop();
+        self.reset_connection();
+        self.provider = ProviderKind::default();
+        self.username.clear();
+        self.api_key.clear();
+        self.openshock_token.clear();
+        self.preferred_target = None;
+        self.shock_mode = ShockMode::default();
+        self.min_intensity = MIN_SHOCK_INTENSITY;
+        self.max_intensity = MIN_SHOCK_INTENSITY;
+        self.intensity = MIN_SHOCK_INTENSITY;
+        self.min_duration = MIN_SHOCK_DURATION;
+        self.max_duration = MIN_SHOCK_DURATION;
+        self.duration = MIN_SHOCK_DURATION;
+        self.log_path.clear();
+        self.log_detection_status = None;
+        self.bridge_listener = ConsoleLogListener::default();
+        self.bridge_events = None;
+        self.last_bridge_event = None;
+        self.last_death = None;
+        self.listener_action_error = None;
+        self.shock_status = None;
+        self.shock_in_flight = 0;
+        let (shock_sender, shock_result) = spawn_shock_worker();
+        self.shock_sender = shock_sender;
+        self.shock_result = shock_result;
+        true
+    }
+    #[cfg(test)]
+    pub(crate) fn listener_is_running(&self) -> bool {
+        self.bridge_listener.status().phase != ListenerPhase::Stopped
+    }
+    #[cfg(test)]
+    pub(crate) fn runtime_death_and_shock_state_is_clear(&self) -> bool {
+        self.bridge_events.is_none()
+            && self.last_bridge_event.is_none()
+            && self.last_death.is_none()
+            && self.shock_status.is_none()
+            && self.shock_in_flight == 0
+    }
     fn reset_connection(&mut self) {
         if let Some(client) = self.client.take()
             && let Ok(client) = Arc::try_unwrap(client)
@@ -348,6 +404,7 @@ impl AppState {
             && !self.shock_in_progress()
         {
             self.provider = provider;
+            self.preferred_target = None;
             self.reset_connection();
         }
     }
@@ -402,15 +459,27 @@ impl AppState {
         }
     }
     fn apply_devices(&mut self, devices: Vec<ProviderTarget>) {
-        self.selected_device = self
-            .selected_device
-            .take()
-            .filter(|selected| devices.iter().any(|device| device.id() == selected))
+        let selected = self
+            .preferred_target
+            .as_ref()
+            .filter(|preferred| devices.iter().any(|device| device.id() == *preferred))
+            .cloned()
             .or_else(|| devices.first().map(|device| device.id().clone()));
+        self.preferred_target = selected.clone();
+        self.selected_device = selected;
         self.devices = devices;
         self.credential_state = CredentialState::Valid;
         self.sound_status = None;
         self.connection_error = None;
+    }
+    fn select_device(&mut self, target: TargetId) -> bool {
+        if !self.devices.iter().any(|device| device.id() == &target) {
+            return false;
+        }
+        self.selected_device = Some(target.clone());
+        self.preferred_target = Some(target);
+        self.sound_status = None;
+        true
     }
     fn start_sound(&mut self, context: egui::Context) {
         let Some(client) = self.client.clone() else {
@@ -641,8 +710,7 @@ impl AppState {
         self.poll_connection_test();
         self.poll_shock();
         self.poll_bridge_events();
-        let busy =
-            self.connection_in_progress() || self.sound_in_progress() || self.shock_in_progress();
+        let busy = self.is_busy();
         ui.heading("Provider");
         let mut provider = self.provider;
         ui.add_enabled_ui(!busy, |ui| {
@@ -714,7 +782,7 @@ impl AppState {
                 }
             });
         let mut selection_changed = false;
-        let selected_device = &mut self.selected_device;
+        let mut selected_device = self.selected_device.clone();
         ui.add_enabled_ui(selection_enabled, |ui| {
             egui::ComboBox::from_id_salt("device")
                 .selected_text(selected_name.as_str())
@@ -723,7 +791,7 @@ impl AppState {
                     for device in &self.devices {
                         selection_changed |= ui
                             .selectable_value(
-                                selected_device,
+                                &mut selected_device,
                                 Some(device.id().clone()),
                                 device.name(),
                             )
@@ -731,8 +799,8 @@ impl AppState {
                     }
                 });
         });
-        if selection_changed {
-            self.sound_status = None;
+        if selection_changed && let Some(target) = selected_device {
+            self.select_device(target);
         }
         let can_sound = self.selected_device.is_some() && self.client.is_some() && !busy;
         if ui
@@ -772,7 +840,7 @@ impl AppState {
                         ui,
                         "Minimum intensity",
                         &mut self.min_intensity,
-                        1.0..=100.0,
+                        MIN_SHOCK_INTENSITY..=MAX_SHOCK_INTENSITY,
                         1.0,
                         "%",
                     );
@@ -780,7 +848,7 @@ impl AppState {
                         ui,
                         "Maximum intensity",
                         &mut self.max_intensity,
-                        1.0..=100.0,
+                        MIN_SHOCK_INTENSITY..=MAX_SHOCK_INTENSITY,
                         1.0,
                         "%",
                     );
@@ -788,7 +856,7 @@ impl AppState {
                         ui,
                         "Minimum duration",
                         &mut self.min_duration,
-                        0.3..=3.0,
+                        MIN_SHOCK_DURATION..=MAX_SHOCK_DURATION,
                         0.1,
                         " s",
                     );
@@ -796,14 +864,28 @@ impl AppState {
                         ui,
                         "Maximum duration",
                         &mut self.max_duration,
-                        0.3..=3.0,
+                        MIN_SHOCK_DURATION..=MAX_SHOCK_DURATION,
                         0.1,
                         " s",
                     );
                 }
                 ShockMode::Fixed => {
-                    slider_input(ui, "Intensity", &mut self.intensity, 1.0..=100.0, 1.0, "%");
-                    slider_input(ui, "Duration", &mut self.duration, 0.3..=3.0, 0.1, " s");
+                    slider_input(
+                        ui,
+                        "Intensity",
+                        &mut self.intensity,
+                        MIN_SHOCK_INTENSITY..=MAX_SHOCK_INTENSITY,
+                        1.0,
+                        "%",
+                    );
+                    slider_input(
+                        ui,
+                        "Duration",
+                        &mut self.duration,
+                        MIN_SHOCK_DURATION..=MAX_SHOCK_DURATION,
+                        0.1,
+                        " s",
+                    );
                 }
             }
         });
@@ -848,12 +930,145 @@ impl AppState {
     }
 }
 
+pub struct CompanionApp {
+    pub state: AppState,
+    persistence: Persistence,
+    reset_confirmation: bool,
+}
+
+impl CompanionApp {
+    pub fn load() -> Self {
+        match default_state_path() {
+            Ok(path) => Self::load_from_path(path),
+            Err(error) => {
+                let (persistence, state) = Persistence::unavailable(error);
+                Self {
+                    state: state.restore_app(),
+                    persistence,
+                    reset_confirmation: false,
+                }
+            }
+        }
+    }
+
+    pub(crate) fn load_from_path(path: PathBuf) -> Self {
+        let (persistence, state) = Persistence::open(path);
+        Self {
+            state: state.restore_app(),
+            persistence,
+            reset_confirmation: false,
+        }
+    }
+
+    pub fn draw(&mut self, ui: &mut Ui) {
+        self.draw_menu(ui);
+        if let Some(warning) = self.persistence.load_warning() {
+            status_line(ui, warning, [0.92, 0.68, 0.22, 1.0]);
+        }
+        if let Some(error) = self.persistence.save_error() {
+            status_line(ui, error, [0.92, 0.32, 0.28, 1.0]);
+        }
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            egui::Frame::NONE.inner_margin(8.0).show(ui, |ui| {
+                self.state.draw(ui);
+            });
+        });
+        self.draw_reset_confirmation(ui);
+
+        if let Some(delay) = self
+            .persistence
+            .observe(PersistedState::from_app(&self.state), Instant::now())
+        {
+            ui.ctx().request_repaint_after(delay);
+        }
+    }
+
+    pub fn flush_pending(&mut self) {
+        let _ = self
+            .persistence
+            .flush(PersistedState::from_app(&self.state));
+    }
+
+    fn draw_menu(&mut self, ui: &mut Ui) {
+        let reset_available = !self.state.is_busy();
+        egui::MenuBar::new().ui(ui, |ui| {
+            ui.menu_button("Menu", |ui| {
+                let response =
+                    ui.add_enabled(reset_available, egui::Button::new("Reset saved state…"));
+                if response.clicked() {
+                    self.reset_confirmation = true;
+                }
+                if !reset_available {
+                    response.on_disabled_hover_text(
+                        "Wait for connection, sound, and shock work to finish before resetting.",
+                    );
+                }
+            });
+        });
+    }
+
+    fn draw_reset_confirmation(&mut self, ui: &mut Ui) {
+        if !self.reset_confirmation {
+            return;
+        }
+
+        let mut open = true;
+        let mut confirm = false;
+        let mut cancel = false;
+        let reset_available = !self.state.is_busy();
+        egui::Window::new("Reset saved state?")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ui.ctx(), |ui| {
+                ui.label(
+                    "This clears saved credentials, target preference, shock settings, and log path.",
+                );
+                ui.label("Any active log listener will be stopped.");
+                if !reset_available {
+                    status_line(
+                        ui,
+                        "Wait for connection, sound, and shock work to finish.",
+                        [0.92, 0.68, 0.22, 1.0],
+                    );
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                    if ui
+                        .add_enabled(reset_available, egui::Button::new("Reset"))
+                        .clicked()
+                    {
+                        confirm = true;
+                    }
+                });
+            });
+        self.reset_confirmation = open && !cancel;
+        if confirm && self.reset_and_save() {
+            self.reset_confirmation = false;
+        }
+    }
+
+    fn reset_and_save(&mut self) -> bool {
+        if !self.state.reset_saved_state() {
+            return false;
+        }
+        let _ = self
+            .persistence
+            .save_reset_now(PersistedState::from_app(&self.state));
+        true
+    }
+}
+
 fn portable_intensity(value: f32) -> Option<u8> {
-    (value.is_finite() && value.fract() == 0.0 && (1.0..=100.0).contains(&value))
-        .then_some(value as u8)
+    (value.is_finite()
+        && value.fract() == 0.0
+        && (MIN_SHOCK_INTENSITY..=MAX_SHOCK_INTENSITY).contains(&value))
+    .then_some(value as u8)
 }
 fn portable_duration(value: f32) -> Option<u64> {
-    if !value.is_finite() || !(0.3..=3.0).contains(&value) {
+    if !value.is_finite() || !(MIN_SHOCK_DURATION..=MAX_SHOCK_DURATION).contains(&value) {
         return None;
     }
     Some((value * 1_000.0).round() as u64)
@@ -962,12 +1177,13 @@ mod tests {
         assert!(state.credentials_present());
     }
     #[test]
-    fn switching_provider_resets_active_selection_but_retains_forms() {
+    fn switching_provider_clears_active_and_preferred_targets_but_retains_forms() {
         let mut state = AppState {
             username: "user".into(),
             api_key: "key".into(),
             devices: vec![ProviderTarget::new(TargetId::PiShock(1), "hub")],
             selected_device: Some(TargetId::PiShock(1)),
+            preferred_target: Some(TargetId::PiShock(1)),
             credential_state: CredentialState::Valid,
             ..AppState::default()
         };
@@ -975,37 +1191,54 @@ mod tests {
         assert_eq!(state.provider, ProviderKind::OpenShock);
         assert!(state.devices.is_empty());
         assert!(state.selected_device.is_none());
+        assert!(state.preferred_target.is_none());
         assert_eq!(state.username, "user");
         assert_eq!(state.api_key, "key");
     }
     #[test]
-    fn device_refresh_retains_valid_selection_and_selects_first_otherwise() {
+    fn preferred_target_is_reconciled_only_against_freshly_fetched_targets() {
+        let preferred = TargetId::PiShock(2);
         let mut state = AppState {
-            selected_device: Some(TargetId::PiShock(2)),
+            preferred_target: Some(preferred.clone()),
             ..AppState::default()
         };
+        assert!(state.selected_device.is_none());
         state.apply_devices(vec![
             ProviderTarget::new(TargetId::PiShock(1), "Alpha"),
-            ProviderTarget::new(TargetId::PiShock(2), "Beta"),
+            ProviderTarget::new(preferred.clone(), "Beta"),
         ]);
-        assert_eq!(state.selected_device, Some(TargetId::PiShock(2)));
+        assert_eq!(state.selected_device, Some(preferred.clone()));
         assert_eq!(
             state.selected_device().map(ProviderTarget::name),
             Some("Beta")
         );
+
+        state.reset_connection();
+        assert!(state.selected_device.is_none());
+        assert_eq!(state.preferred_target, Some(preferred.clone()));
+        state.apply_connection_result(Err(ProviderError::NotConnected));
+        assert_eq!(state.preferred_target, Some(preferred.clone()));
+
         state.apply_devices(vec![ProviderTarget::new(TargetId::PiShock(3), "Gamma")]);
+        assert_eq!(state.selected_device, Some(TargetId::PiShock(3)));
+        assert_eq!(state.preferred_target, Some(TargetId::PiShock(3)));
+        assert!(state.select_device(TargetId::PiShock(3)));
+        assert_eq!(state.preferred_target, Some(TargetId::PiShock(3)));
+        assert!(!state.select_device(TargetId::PiShock(99)));
         assert_eq!(state.selected_device, Some(TargetId::PiShock(3)));
     }
     #[test]
-    fn failed_connection_clears_stale_targets() {
+    fn failed_connection_clears_stale_live_targets_but_preserves_preference() {
         let mut state = AppState {
             devices: vec![ProviderTarget::new(TargetId::PiShock(1), "hub")],
             selected_device: Some(TargetId::PiShock(1)),
+            preferred_target: Some(TargetId::PiShock(1)),
             ..AppState::default()
         };
         state.apply_connection_result(Err(ProviderError::NotConnected));
         assert!(state.devices.is_empty());
         assert!(state.selected_device.is_none());
+        assert_eq!(state.preferred_target, Some(TargetId::PiShock(1)));
         assert_eq!(state.credential_state, CredentialState::Invalid);
     }
     #[test]
@@ -1189,5 +1422,71 @@ mod tests {
         };
         state.apply_log_detection(Err(DetectionError::DeadlockNotInstalled));
         assert_eq!(state.log_path, "/manual/console.log");
+    }
+    #[test]
+    fn reset_is_blocked_by_each_in_flight_work_kind() {
+        let mut connection_busy = AppState {
+            username: "keep".to_owned(),
+            ..AppState::default()
+        };
+        let (_sender, receiver) = mpsc::channel();
+        connection_busy.connection_result = Some(receiver);
+        assert!(!connection_busy.reset_saved_state());
+        assert_eq!(connection_busy.username, "keep");
+
+        let mut sound_busy = AppState::default();
+        let (_sender, receiver) = mpsc::channel();
+        sound_busy.sound_result = Some(receiver);
+        assert!(!sound_busy.reset_saved_state());
+
+        let mut shock_busy = AppState::default();
+        shock_busy.shock_in_flight = 1;
+        assert!(!shock_busy.reset_saved_state());
+        assert_eq!(shock_busy.shock_in_flight, 1);
+    }
+
+    #[test]
+    fn confirmed_reset_stops_runtime_state_and_writes_durable_defaults_immediately() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.json");
+        let mut app = CompanionApp::load_from_path(path.clone());
+        app.state.provider = ProviderKind::OpenShock;
+        app.state.openshock_token = "secret".to_owned();
+        app.state.preferred_target = Some(TargetId::OpenShock("group".to_owned()));
+        app.state.shock_mode = ShockMode::Fixed;
+        app.state.intensity = 80.0;
+        let log_path = directory.path().join("console.log");
+        app.state.log_path = log_path.display().to_string();
+        app.state.start_log_listener(log_path).unwrap();
+        app.state.queue_death_shock(death("session", 1));
+        assert!(app.state.listener_is_running());
+        assert!(!app.state.runtime_death_and_shock_state_is_clear());
+
+        assert!(app.reset_and_save());
+        assert_eq!(
+            PersistedState::from_app(&app.state),
+            PersistedState::default()
+        );
+        assert!(!app.state.listener_is_running());
+        assert!(app.state.runtime_death_and_shock_state_is_clear());
+        assert_eq!(app.state.credential_state, CredentialState::Unknown);
+        assert!(app.state.devices.is_empty());
+        assert!(app.state.selected_device.is_none());
+        let written = std::fs::read_to_string(path).unwrap();
+        assert_eq!(
+            serde_json::from_str::<PersistedState>(&written).unwrap(),
+            PersistedState::default()
+        );
+    }
+
+    #[test]
+    fn persistence_aware_app_renders_with_an_injected_state_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = CompanionApp::load_from_path(directory.path().join("state.json"));
+        let context = egui::Context::default();
+        let output = context.run_ui(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.draw(ui));
+        });
+        assert!(!output.shapes.is_empty());
     }
 }

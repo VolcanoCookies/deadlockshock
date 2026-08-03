@@ -1,17 +1,18 @@
 pub mod app;
 pub mod bridge_listener;
 pub mod deadlock_path;
+pub mod persistence;
 pub mod provider;
-use app::AppState;
+use app::CompanionApp;
 use eframe::egui;
 
-impl eframe::App for AppState {
+impl eframe::App for CompanionApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            egui::Frame::NONE.inner_margin(8.0).show(ui, |ui| {
-                self.draw(ui);
-            });
-        });
+        self.draw(ui);
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.flush_pending();
     }
 }
 
@@ -27,6 +28,6 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "Companion",
         options,
-        Box::new(|_creation_context| Ok(Box::new(AppState::default()))),
+        Box::new(|_creation_context| Ok(Box::new(CompanionApp::load()))),
     )
 }
