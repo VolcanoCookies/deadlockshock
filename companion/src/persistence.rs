@@ -521,7 +521,23 @@ fn set_private_file_permissions(_file: &fs::File) -> Result<(), String> {
 }
 #[cfg(target_os = "windows")]
 fn open_directory(path: &Path) -> Result<(), String> {
-    run_directory_opener("explorer", path)
+    spawn_directory_opener("explorer", path)
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn spawn_directory_opener(program: &str, path: &Path) -> Result<(), String> {
+    // Explorer commonly exits with code 1 after successfully handing the folder
+    // off to the existing shell process, so only failure to launch is an error.
+    Command::new(program)
+        .arg(path)
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| {
+            format!(
+                "Could not start the operating system's folder opener for {}: {error}",
+                path.display()
+            )
+        })
 }
 
 #[cfg(target_os = "macos")]
@@ -539,7 +555,7 @@ fn open_directory(_path: &Path) -> Result<(), String> {
     Err("Opening the config folder is unsupported on this operating system.".to_owned())
 }
 
-#[cfg(any(target_os = "windows", target_os = "macos", unix))]
+#[cfg(unix)]
 fn run_directory_opener(program: &str, path: &Path) -> Result<(), String> {
     let status = Command::new(program).arg(path).status().map_err(|error| {
         format!(
@@ -794,6 +810,7 @@ mod tests {
     #[test]
     fn config_folder_action_creates_and_opens_the_state_directory() {
         let root = tempfile::tempdir().unwrap();
+
         let state_path = root.path().join("nested").join("state.json");
         let expected_directory = state_path.parent().unwrap().to_owned();
         let (persistence, _) = Persistence::open(state_path);
@@ -809,6 +826,11 @@ mod tests {
             .unwrap();
 
         assert!(opened.get());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn detached_folder_opener_ignores_the_child_exit_code() {
+        assert!(spawn_directory_opener("/bin/false", Path::new(".")).is_ok());
     }
 
     #[test]
