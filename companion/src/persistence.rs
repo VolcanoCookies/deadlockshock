@@ -1,6 +1,7 @@
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -518,6 +519,43 @@ fn set_private_file_permissions(file: &fs::File) -> Result<(), String> {
 fn set_private_file_permissions(_file: &fs::File) -> Result<(), String> {
     Ok(())
 }
+#[cfg(target_os = "windows")]
+fn open_directory(path: &Path) -> Result<(), String> {
+    run_directory_opener("explorer", path)
+}
+
+#[cfg(target_os = "macos")]
+fn open_directory(path: &Path) -> Result<(), String> {
+    run_directory_opener("open", path)
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn open_directory(path: &Path) -> Result<(), String> {
+    run_directory_opener("xdg-open", path)
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos", unix)))]
+fn open_directory(_path: &Path) -> Result<(), String> {
+    Err("Opening the config folder is unsupported on this operating system.".to_owned())
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos", unix))]
+fn run_directory_opener(program: &str, path: &Path) -> Result<(), String> {
+    let status = Command::new(program).arg(path).status().map_err(|error| {
+        format!(
+            "Could not start the operating system's folder opener for {}: {error}",
+            path.display()
+        )
+    })?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "The operating system's folder opener failed for {} with status {status}.",
+            path.display()
+        ))
+    }
+}
 
 #[derive(Clone, Copy)]
 enum SaveReason {
@@ -594,6 +632,36 @@ impl Persistence {
 
     pub(crate) fn save_error(&self) -> Option<&str> {
         self.save_error.as_deref()
+    }
+    pub(crate) fn open_config_directory(&self) -> Result<(), String> {
+        self.open_config_directory_with(open_directory)
+    }
+
+    fn open_config_directory_with(
+        &self,
+        opener: impl FnOnce(&Path) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let state_path = self
+            .path
+            .as_deref()
+            .ok_or_else(|| "No per-user config folder is available.".to_owned())?;
+        let directory = state_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .ok_or_else(|| {
+                format!(
+                    "The saved-state path {} has no containing folder.",
+                    state_path.display()
+                )
+            })?;
+        fs::create_dir_all(directory).map_err(|error| {
+            format!(
+                "Could not create the config folder {}: {error}",
+                directory.display()
+            )
+        })?;
+        set_private_directory_permissions(directory)?;
+        opener(directory)
     }
 
     pub(crate) fn observe(&mut self, state: PersistedState, now: Instant) -> Option<Duration> {
@@ -723,6 +791,25 @@ mod tests {
     use super::*;
     use crate::app::{CredentialState, ShockMode};
     use crate::provider::ProviderTarget;
+    #[test]
+    fn config_folder_action_creates_and_opens_the_state_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let state_path = root.path().join("nested").join("state.json");
+        let expected_directory = state_path.parent().unwrap().to_owned();
+        let (persistence, _) = Persistence::open(state_path);
+        let opened = std::cell::Cell::new(false);
+
+        persistence
+            .open_config_directory_with(|directory| {
+                assert_eq!(directory, expected_directory);
+                assert!(directory.is_dir());
+                opened.set(true);
+                Ok(())
+            })
+            .unwrap();
+
+        assert!(opened.get());
+    }
 
     #[test]
     fn json_roundtrip_is_readable_versioned_and_restores_only_durable_state() {

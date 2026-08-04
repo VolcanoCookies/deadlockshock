@@ -1190,6 +1190,7 @@ pub struct CompanionApp {
     pub state: AppState,
     persistence: Persistence,
     reset_confirmation: bool,
+    menu_error: Option<String>,
 }
 
 impl CompanionApp {
@@ -1207,6 +1208,7 @@ impl CompanionApp {
                     state: state.restore_app(),
                     persistence,
                     reset_confirmation: false,
+                    menu_error: None,
                 }
             }
         }
@@ -1218,6 +1220,7 @@ impl CompanionApp {
             state: state.restore_app(),
             persistence,
             reset_confirmation: false,
+            menu_error: None,
         }
     }
 
@@ -1227,6 +1230,9 @@ impl CompanionApp {
             status_line(ui, warning, [0.92, 0.68, 0.22, 1.0]);
         }
         if let Some(error) = self.persistence.save_error() {
+            status_line(ui, error, [0.92, 0.32, 0.28, 1.0]);
+        }
+        if let Some(error) = &self.menu_error {
             status_line(ui, error, [0.92, 0.32, 0.28, 1.0]);
         }
         egui::ScrollArea::vertical().show(ui, |ui| {
@@ -1258,6 +1264,18 @@ impl CompanionApp {
         let reset_available = !self.state.is_busy();
         egui::MenuBar::new().ui(ui, |ui| {
             ui.menu_button("Menu", |ui| {
+                if ui.button("Open config folder").clicked() {
+                    log::info!(target: "companion::app", "config_folder_open_requested");
+                    self.menu_error = self.persistence.open_config_directory().err();
+                    if let Some(error) = &self.menu_error {
+                        log::warn!(
+                            target: "companion::app",
+                            "config_folder_open_failed error={:?}",
+                            error
+                        );
+                    }
+                }
+                ui.separator();
                 let response =
                     ui.add_enabled(reset_available, egui::Button::new("Reset saved state…"));
                 if response.clicked() {
