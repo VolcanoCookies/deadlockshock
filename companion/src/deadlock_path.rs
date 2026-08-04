@@ -81,7 +81,14 @@ pub fn detect() -> Result<Detection, DetectionError> {
 }
 
 pub(crate) fn detect_in_roots(roots: &[PathBuf]) -> Result<Detection, DetectionError> {
+    let input_root_count = roots.len();
     let roots = deduplicate_paths(roots.iter().cloned());
+    log::debug!(
+        target: "companion::deadlock_path",
+        "deadlock_roots discovered={} deduplicated={}",
+        input_root_count,
+        roots.len()
+    );
     if roots.is_empty() {
         return Err(DetectionError::SteamNotFound);
     }
@@ -152,6 +159,11 @@ pub(crate) fn detect_in_roots(roots: &[PathBuf]) -> Result<Detection, DetectionE
     }
 
     let libraries = deduplicate_paths(libraries);
+    log::debug!(
+        target: "companion::deadlock_path",
+        "deadlock_libraries count={}",
+        libraries.len()
+    );
     let mut candidates = Vec::new();
     let mut invalid_installs = Vec::new();
     let mut manifest_found = false;
@@ -237,6 +249,12 @@ pub(crate) fn detect_in_roots(roots: &[PathBuf]) -> Result<Detection, DetectionE
 
     candidates = deduplicate_candidates(candidates);
     invalid_installs = deduplicate_paths(invalid_installs);
+    log::debug!(
+        target: "companion::deadlock_path",
+        "deadlock_candidates count={} invalid_installs={}",
+        candidates.len(),
+        invalid_installs.len()
+    );
     if candidates.is_empty() {
         return if manifest_found {
             Err(DetectionError::InvalidInstall {
@@ -257,15 +275,23 @@ fn select_candidate(mut candidates: Vec<Candidate>) -> Result<Detection, Detecti
         .count();
 
     if existing_count == 0 {
-        return if candidates.len() == 1 {
-            Ok(Detection::NotCreated {
+        if candidates.len() == 1 {
+            log::debug!(
+                target: "companion::deadlock_path",
+                "deadlock_selection reason=only_candidate_log_missing"
+            );
+            return Ok(Detection::NotCreated {
                 path: candidates.remove(0).path,
-            })
-        } else {
-            Err(DetectionError::AmbiguousInstalls {
-                paths: sorted_candidate_paths(candidates),
-            })
-        };
+            });
+        }
+        log::debug!(
+            target: "companion::deadlock_path",
+            "deadlock_selection reason=ambiguous_without_logs candidates={}",
+            candidates.len()
+        );
+        return Err(DetectionError::AmbiguousInstalls {
+            paths: sorted_candidate_paths(candidates),
+        });
     }
 
     candidates.retain(|candidate| candidate.modified.is_some());
@@ -280,10 +306,19 @@ fn select_candidate(mut candidates: Vec<Candidate>) -> Result<Detection, Detecti
         .collect();
 
     if newest_candidates.len() == 1 {
+        log::debug!(
+            target: "companion::deadlock_path",
+            "deadlock_selection reason=newest_log"
+        );
         Ok(Detection::Ready {
             path: newest_candidates.remove(0).path,
         })
     } else {
+        log::debug!(
+            target: "companion::deadlock_path",
+            "deadlock_selection reason=tied_newest candidates={}",
+            newest_candidates.len()
+        );
         Err(DetectionError::AmbiguousInstalls {
             paths: sorted_candidate_paths(newest_candidates),
         })

@@ -16,7 +16,25 @@ impl eframe::App for CompanionApp {
     }
 }
 
+fn init_logging() {
+    env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("warn,companion=info"),
+    )
+    .format_timestamp_millis()
+    .format_module_path(true)
+    .init();
+}
+
 fn main() -> eframe::Result {
+    init_logging();
+    log::info!(
+        target: "companion",
+        "process_start version={} os={} arch={}",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    );
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Companion")
@@ -25,9 +43,14 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
 
-    eframe::run_native(
+    let result = eframe::run_native(
         "Companion",
         options,
         Box::new(|_creation_context| Ok(Box::new(CompanionApp::load()))),
-    )
+    );
+    match &result {
+        Ok(()) => log::info!(target: "companion", "process_exit status=success"),
+        Err(error) => log::error!(target: "companion", "eframe_launch_failed error={:?}", error),
+    }
+    result
 }

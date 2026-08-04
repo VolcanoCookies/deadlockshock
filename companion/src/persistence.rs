@@ -317,23 +317,42 @@ pub(crate) struct LoadOutcome {
 }
 
 pub(crate) fn default_state_path() -> Result<PathBuf, String> {
-    dirs::config_dir()
+    let result = dirs::config_dir()
         .map(|directory| directory.join("deadlockshock-companion").join("state.json"))
         .ok_or_else(|| {
             "The operating system did not provide a per-user config directory.".to_owned()
-        })
+        });
+    if let Ok(path) = &result {
+        log::info!(
+            target: "companion::persistence",
+            "settings_path_resolved path={:?}",
+            path
+        );
+    }
+    result
 }
 
 pub(crate) fn load_from_path(path: &Path) -> LoadOutcome {
     let source = match fs::read_to_string(path) {
         Ok(source) => source,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            log::info!(
+                target: "companion::persistence",
+                "settings_load_outcome path={:?} outcome=missing_defaults",
+                path
+            );
             return LoadOutcome {
                 state: PersistedState::default(),
                 warning: None,
             };
         }
         Err(error) => {
+            log::warn!(
+                target: "companion::persistence",
+                "settings_load_failed path={:?} stage=read error={:?}",
+                path,
+                error
+            );
             return LoadOutcome {
                 state: PersistedState::default(),
                 warning: Some(format!(
@@ -348,17 +367,40 @@ pub(crate) fn load_from_path(path: &Path) -> LoadOutcome {
         .map_err(|error| error.to_string())
         .and_then(PersistedState::normalized);
     match loaded {
-        Ok(state) => LoadOutcome {
-            state,
-            warning: None,
-        },
+        Ok(state) => {
+            log::info!(
+                target: "companion::persistence",
+                "settings_load_outcome path={:?} outcome=loaded",
+                path
+            );
+            LoadOutcome {
+                state,
+                warning: None,
+            }
+        }
         Err(error) => {
             let preservation = match preserve_invalid_file(path) {
-                Ok(backup) => format!("The invalid file was preserved at {}.", backup.display()),
-                Err(backup_error) => format!(
-                    "The invalid file could not be moved to a backup ({backup_error}); it remains at {}.",
-                    path.display()
-                ),
+                Ok(backup) => {
+                    log::warn!(
+                        target: "companion::persistence",
+                        "settings_load_failed path={:?} stage=parse backup={:?}",
+                        path,
+                        backup
+                    );
+                    format!("The invalid file was preserved at {}.", backup.display())
+                }
+                Err(backup_error) => {
+                    log::warn!(
+                        target: "companion::persistence",
+                        "settings_load_failed path={:?} stage=parse backup_failed error={:?}",
+                        path,
+                        backup_error
+                    );
+                    format!(
+                        "The invalid file could not be moved to a backup ({backup_error}); it remains at {}.",
+                        path.display()
+                    )
+                }
             };
             LoadOutcome {
                 state: PersistedState::default(),
@@ -499,6 +541,12 @@ impl Persistence {
     pub(crate) fn open(path: PathBuf) -> (Self, PersistedState) {
         let outcome = load_from_path(&path);
         let state = outcome.state;
+        log::info!(
+            target: "companion::persistence",
+            "settings_opened path={:?} load_warning={}",
+            path,
+            outcome.warning.is_some()
+        );
         (
             Self {
                 path: Some(path),
@@ -516,6 +564,11 @@ impl Persistence {
     }
 
     pub(crate) fn unavailable(message: String) -> (Self, PersistedState) {
+        log::warn!(
+            target: "companion::persistence",
+            "settings_unavailable reason={:?}",
+            message
+        );
         let state = PersistedState::default();
         (
             Self {
@@ -550,13 +603,26 @@ impl Persistence {
                 self.pending = None;
                 self.deadline = None;
                 self.save_error = None;
+                log::debug!(
+                    target: "companion::persistence",
+                    "settings_autosave_cancelled reason=reverted_to_saved"
+                );
             } else {
+                let coalesced = self.pending.is_some();
                 self.pending = Some(state);
                 self.pending_reason = SaveReason::Autosave;
                 self.deadline = Some(now + self.debounce);
+                log::debug!(
+                    target: "companion::persistence",
+                    "settings_autosave_scheduled coalesced={coalesced}"
+                );
             }
         } else if self.pending.is_some() && self.deadline.is_none() {
             self.deadline = Some(now + self.debounce);
+            log::debug!(
+                target: "companion::persistence",
+                "settings_autosave_rescheduled"
+            );
         }
 
         if self.deadline.is_some_and(|deadline| deadline <= now) {
@@ -575,14 +641,20 @@ impl Persistence {
     }
 
     pub(crate) fn save_reset_now(&mut self, state: PersistedState) -> Result<(), ()> {
+        log::info!(target: "companion::persistence", "settings_reset_save_started");
         self.observed = state.clone();
         self.commit(state, SaveReason::Reset)
     }
 
     pub(crate) fn flush(&mut self, state: PersistedState) -> Result<(), ()> {
         if state == self.saved && self.pending.is_none() {
+            log::debug!(
+                target: "companion::persistence",
+                "settings_flush_noop reason=clean"
+            );
             return Ok(());
         }
+        log::debug!(target: "companion::persistence", "settings_flush_started");
         self.observed = state.clone();
         let reason = self
             .pending
@@ -600,13 +672,24 @@ impl Persistence {
             .and_then(|path| write_state(path, &state));
         match result {
             Ok(()) => {
+                let recovered = self.save_error.is_some();
                 self.saved = state;
                 self.pending = None;
                 self.deadline = None;
                 self.save_error = None;
+                log::info!(
+                    target: "companion::persistence",
+                    "settings_save_committed reason={} recovered={}",
+                    match reason {
+                        SaveReason::Autosave => "autosave",
+                        SaveReason::Reset => "reset",
+                    },
+                    recovered
+                );
                 Ok(())
             }
             Err(error) => {
+                let first_failure = self.save_error.is_none();
                 self.pending = Some(state);
                 self.pending_reason = reason;
                 self.deadline = None;
@@ -618,6 +701,17 @@ impl Persistence {
                         "Current settings were reset in memory, but saved state could not be replaced: {error} The previous disk state may return after restart."
                     ),
                 });
+                if first_failure {
+                    log::warn!(
+                        target: "companion::persistence",
+                        "settings_save_failed reason={} error={:?}",
+                        match reason {
+                            SaveReason::Autosave => "autosave",
+                            SaveReason::Reset => "reset",
+                        },
+                        error
+                    );
+                }
                 Err(())
             }
         }
@@ -773,8 +867,10 @@ mod tests {
     fn unsupported_schema_is_backed_up_like_malformed_json() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("state.json");
-        let mut state = PersistedState::default();
-        state.schema_version = SCHEMA_VERSION + 1;
+        let state = PersistedState {
+            schema_version: SCHEMA_VERSION + 1,
+            ..PersistedState::default()
+        };
         fs::write(&path, serde_json::to_vec(&state).unwrap()).unwrap();
 
         let outcome = load_from_path(&path);

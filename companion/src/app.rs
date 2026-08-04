@@ -89,6 +89,14 @@ impl LogDetectionStatus {
 
 type ConnectionResult = Result<(ConnectedProvider, Vec<ProviderTarget>), ProviderError>;
 type SoundResult = Result<(), ProviderError>;
+fn provider_error_kind(error: &ProviderError) -> &'static str {
+    match error {
+        ProviderError::PiShock(_) => "pishock",
+        ProviderError::OpenShock(_) => "openshock",
+        ProviderError::TargetProviderMismatch => "target_provider_mismatch",
+        ProviderError::NotConnected => "not_connected",
+    }
+}
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum SoundStatus {
     Sending,
@@ -340,6 +348,7 @@ impl AppState {
     }
     pub(crate) fn reset_saved_state(&mut self) -> bool {
         if self.is_busy() {
+            log::warn!(target: "companion::app", "settings_reset_skipped reason=busy");
             return false;
         }
 
@@ -369,6 +378,7 @@ impl AppState {
         let (shock_sender, shock_result) = spawn_shock_worker();
         self.shock_sender = shock_sender;
         self.shock_result = shock_result;
+        log::info!(target: "companion::app", "settings_reset_applied provider={}", self.provider.label());
         true
     }
     #[cfg(test)]
@@ -383,11 +393,27 @@ impl AppState {
             && self.shock_status.is_none()
             && self.shock_in_flight == 0
     }
+
     fn reset_connection(&mut self) {
-        if let Some(client) = self.client.take()
-            && let Ok(client) = Arc::try_unwrap(client)
-        {
-            let _ = client.disconnect();
+        if let Some(client) = self.client.take() {
+            let provider = client.kind().label();
+            match Arc::try_unwrap(client) {
+                Ok(client) => match client.disconnect() {
+                    Ok(()) => log::info!(
+                        target: "companion::app",
+                        "provider_disconnected provider={provider} outcome=success"
+                    ),
+                    Err(error) => log::warn!(
+                        target: "companion::app",
+                        "provider_disconnected provider={provider} outcome=failed error_kind={}",
+                        provider_error_kind(&error)
+                    ),
+                },
+                Err(_) => log::debug!(
+                    target: "companion::app",
+                    "provider_disconnect_skipped provider={provider} reason=shared_client"
+                ),
+            }
         }
         self.credential_state = CredentialState::Unknown;
         self.connection_result = None;
@@ -398,19 +424,37 @@ impl AppState {
         self.sound_status = None;
     }
     fn set_provider(&mut self, provider: ProviderKind) {
-        if self.provider != provider
-            && !self.connection_in_progress()
-            && !self.sound_in_progress()
-            && !self.shock_in_progress()
-        {
-            self.provider = provider;
-            self.preferred_target = None;
-            self.reset_connection();
+        if self.provider == provider {
+            return;
         }
+        if self.connection_in_progress() || self.sound_in_progress() || self.shock_in_progress() {
+            log::debug!(
+                target: "companion::app",
+                "provider_change_skipped from={} to={} reason=busy",
+                self.provider.label(),
+                provider.label()
+            );
+            return;
+        }
+        let previous = self.provider;
+        self.provider = provider;
+        self.preferred_target = None;
+        self.reset_connection();
+        log::info!(
+            target: "companion::app",
+            "provider_changed from={} to={}",
+            previous.label(),
+            provider.label()
+        );
     }
     fn start_connection_test(&mut self, context: egui::Context) {
         let provider = self.provider;
         let credentials = self.provider_credentials();
+        log::info!(
+            target: "companion::app",
+            "connection_test_started provider={}",
+            provider.label()
+        );
         self.reset_connection();
         let (sender, receiver) = mpsc::channel();
         self.credential_state = CredentialState::Testing;
@@ -436,27 +480,49 @@ impl AppState {
             }
             Err(TryRecvError::Empty) => {}
             Err(TryRecvError::Disconnected) => {
+                log::error!(
+                    target: "companion::app",
+                    "connection_worker_failed provider={} reason=channel_closed",
+                    self.provider.label()
+                );
                 self.connection_result = None;
-                self.apply_connection_result(Err(ProviderError::NotConnected));
+                self.apply_connection_error(ProviderError::NotConnected);
             }
         }
     }
+
     fn apply_connection_result(&mut self, result: ConnectionResult) {
         match result {
             Ok((client, devices)) => {
+                let provider = client.kind();
+                log::info!(
+                    target: "companion::app",
+                    "connection_test_succeeded provider={} targets={}",
+                    provider.label(),
+                    devices.len()
+                );
                 self.client = Some(Arc::new(client));
                 self.apply_devices(devices);
             }
             Err(error) => {
-                self.client = None;
-                self.sound_result = None;
-                self.sound_status = None;
-                self.devices.clear();
-                self.selected_device = None;
-                self.credential_state = CredentialState::Invalid;
-                self.connection_error = Some(error.to_string());
+                log::warn!(
+                    target: "companion::app",
+                    "connection_test_failed provider={} error_kind={}",
+                    self.provider.label(),
+                    provider_error_kind(&error)
+                );
+                self.apply_connection_error(error);
             }
         }
+    }
+    fn apply_connection_error(&mut self, error: ProviderError) {
+        self.client = None;
+        self.sound_result = None;
+        self.sound_status = None;
+        self.devices.clear();
+        self.selected_device = None;
+        self.credential_state = CredentialState::Invalid;
+        self.connection_error = Some(error.to_string());
     }
     fn apply_devices(&mut self, devices: Vec<ProviderTarget>) {
         let selected = self
@@ -481,13 +547,22 @@ impl AppState {
         self.sound_status = None;
         true
     }
+
     fn start_sound(&mut self, context: egui::Context) {
         let Some(client) = self.client.clone() else {
+            log::warn!(target: "companion::app", "test_sound_skipped reason=not_connected");
             return;
         };
         let Some(target) = self.selected_device().cloned() else {
+            log::warn!(target: "companion::app", "test_sound_skipped reason=no_target");
             return;
         };
+        log::info!(
+            target: "companion::app",
+            "test_sound_started provider={} target={:?}",
+            client.kind().label(),
+            target.id()
+        );
         let (sender, receiver) = mpsc::channel();
         self.sound_status = Some(SoundStatus::Sending);
         self.sound_result = Some(receiver);
@@ -497,6 +572,7 @@ impl AppState {
             context.request_repaint();
         });
     }
+
     fn poll_sound(&mut self) {
         let Some(receiver) = &self.sound_result else {
             return;
@@ -508,16 +584,34 @@ impl AppState {
             }
             Err(TryRecvError::Empty) => {}
             Err(TryRecvError::Disconnected) => {
+                log::error!(
+                    target: "companion::app",
+                    "test_sound_worker_failed reason=channel_closed"
+                );
                 self.sound_result = None;
-                self.apply_sound_result(Err(ProviderError::NotConnected));
+                self.apply_sound_error(ProviderError::NotConnected);
             }
         }
     }
+
     fn apply_sound_result(&mut self, result: SoundResult) {
-        self.sound_status = Some(match result {
-            Ok(()) => SoundStatus::Sent,
-            Err(error) => SoundStatus::Failed(format!("Test sound failed: {error}")),
-        });
+        match result {
+            Ok(()) => {
+                log::info!(target: "companion::app", "test_sound_succeeded");
+                self.sound_status = Some(SoundStatus::Sent);
+            }
+            Err(error) => {
+                log::warn!(
+                    target: "companion::app",
+                    "test_sound_failed error_kind={}",
+                    provider_error_kind(&error)
+                );
+                self.apply_sound_error(error);
+            }
+        }
+    }
+    fn apply_sound_error(&mut self, error: ProviderError) {
+        self.sound_status = Some(SoundStatus::Failed(format!("Test sound failed: {error}")));
     }
     pub fn resolve_shock(&self) -> Option<ResolvedShock> {
         let mut rng = rand::rng();
@@ -556,32 +650,70 @@ impl AppState {
             match self.shock_result.try_recv() {
                 Ok(completion) => {
                     self.shock_in_flight = self.shock_in_flight.saturating_sub(1);
-                    self.shock_status = Some(match completion.result {
-                        Ok(()) => ShockStatus::Sent(completion.request),
-                        Err(error) => ShockStatus::Failed {
-                            request: completion.request,
-                            error: error.to_string(),
-                        },
-                    });
+                    match completion.result {
+                        Ok(()) => {
+                            log::info!(
+                                target: "companion::app",
+                                "shock_sent provider={} target={:?} intensity={:?} duration_ms={:?} session_id={:?} sequence={}",
+                                completion.request.provider.label(),
+                                completion.request.target.as_ref().map(ProviderTarget::id),
+                                completion.request.resolved.map(|resolved| resolved.intensity),
+                                completion.request.resolved.map(|resolved| resolved.duration_ms),
+                                completion.request.death.session_id,
+                                completion.request.death.sequence
+                            );
+                            self.shock_status = Some(ShockStatus::Sent(completion.request));
+                        }
+                        Err(error) => {
+                            log::warn!(
+                                target: "companion::app",
+                                "shock_failed provider={} target={:?} intensity={:?} duration_ms={:?} session_id={:?} sequence={} error_kind={}",
+                                completion.request.provider.label(),
+                                completion.request.target.as_ref().map(ProviderTarget::id),
+                                completion.request.resolved.map(|resolved| resolved.intensity),
+                                completion.request.resolved.map(|resolved| resolved.duration_ms),
+                                completion.request.death.session_id,
+                                completion.request.death.sequence,
+                                provider_error_kind(&error)
+                            );
+                            self.shock_status = Some(ShockStatus::Failed {
+                                request: completion.request,
+                                error: error.to_string(),
+                            });
+                        }
+                    }
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
+                    log::error!(
+                        target: "companion::app",
+                        "shock_worker_channel_failed reason=disconnected in_flight={}",
+                        self.shock_in_flight
+                    );
                     self.shock_in_flight = 0;
                     break;
                 }
             }
         }
     }
+
     fn death_is_new(&mut self, death: &LocalPlayerDeath) -> bool {
         if let Some((session_id, sequence)) = &self.last_death
             && session_id == &death.session_id
             && death.sequence <= *sequence
         {
+            log::debug!(
+                target: "companion::app",
+                "shock_skipped reason=duplicate_or_out_of_order session_id={:?} sequence={}",
+                death.session_id,
+                death.sequence
+            );
             return false;
         }
         self.last_death = Some((death.session_id.clone(), death.sequence));
         true
     }
+
     fn queue_death_shock(&mut self, death: LocalPlayerDeath) {
         if !self.death_is_new(&death) {
             return;
@@ -598,6 +730,16 @@ impl AppState {
             },
         };
         let Some(client) = self.client.clone() else {
+            log::warn!(
+                target: "companion::app",
+                "shock_skipped provider={} target={:?} intensity={:?} duration_ms={:?} session_id={:?} sequence={} reason=provider_not_connected",
+                request.provider.label(),
+                request.target.as_ref().map(ProviderTarget::id),
+                request.resolved.map(|resolved| resolved.intensity),
+                request.resolved.map(|resolved| resolved.duration_ms),
+                request.death.session_id,
+                request.death.sequence
+            );
             self.shock_status = Some(ShockStatus::Skipped {
                 request,
                 reason: "provider is not connected".to_owned(),
@@ -605,6 +747,15 @@ impl AppState {
             return;
         };
         if request.target.is_none() {
+            log::warn!(
+                target: "companion::app",
+                "shock_skipped provider={} target=none intensity={:?} duration_ms={:?} session_id={:?} sequence={} reason=no_target",
+                request.provider.label(),
+                request.resolved.map(|resolved| resolved.intensity),
+                request.resolved.map(|resolved| resolved.duration_ms),
+                request.death.session_id,
+                request.death.sequence
+            );
             self.shock_status = Some(ShockStatus::Skipped {
                 request,
                 reason: "no target is selected".to_owned(),
@@ -612,6 +763,14 @@ impl AppState {
             return;
         }
         if request.resolved.is_none() {
+            log::warn!(
+                target: "companion::app",
+                "shock_skipped provider={} target={:?} intensity=none duration_ms=none session_id={:?} sequence={} reason=invalid_settings",
+                request.provider.label(),
+                request.target.as_ref().map(ProviderTarget::id),
+                request.death.session_id,
+                request.death.sequence
+            );
             self.shock_status = Some(ShockStatus::Skipped {
                 request,
                 reason: "shock settings are invalid".to_owned(),
@@ -628,15 +787,37 @@ impl AppState {
             })
             .is_err()
         {
+            log::error!(
+                target: "companion::app",
+                "shock_failed provider={} target={:?} intensity={:?} duration_ms={:?} session_id={:?} sequence={} reason=worker_unavailable",
+                request.provider.label(),
+                request.target.as_ref().map(ProviderTarget::id),
+                request.resolved.map(|resolved| resolved.intensity),
+                request.resolved.map(|resolved| resolved.duration_ms),
+                request.death.session_id,
+                request.death.sequence
+            );
             self.shock_in_flight = self.shock_in_flight.saturating_sub(1);
             self.shock_status = Some(ShockStatus::Failed {
                 request,
                 error: "shock worker is unavailable".to_owned(),
             });
+        } else {
+            log::info!(
+                target: "companion::app",
+                "shock_queued provider={} target={:?} intensity={:?} duration_ms={:?} session_id={:?} sequence={}",
+                request.provider.label(),
+                request.target.as_ref().map(ProviderTarget::id),
+                request.resolved.map(|resolved| resolved.intensity),
+                request.resolved.map(|resolved| resolved.duration_ms),
+                request.death.session_id,
+                request.death.sequence
+            );
         }
     }
     fn ensure_bridge_subscription(&mut self) {
         if self.bridge_events.is_none() {
+            log::debug!(target: "companion::app", "bridge_subscription_created");
             self.bridge_events = Some(self.bridge_listener.subscribe());
         }
     }
@@ -648,6 +829,23 @@ impl AppState {
         while let Some(result) = self.bridge_events.as_ref().map(Receiver::try_recv) {
             match result {
                 Ok(event) => {
+                    match &event {
+                        BridgeEvent::HookReady(ready) => log::info!(
+                            target: "companion::app",
+                            "bridge_hook_ready session_id={:?} client_time_ms={} poll_interval_ms={}",
+                            ready.session_id,
+                            ready.client_time_ms,
+                            ready.poll_interval_ms
+                        ),
+                        BridgeEvent::LocalPlayerDeath(death) => log::info!(
+                            target: "companion::app",
+                            "bridge_death_received session_id={:?} sequence={} client_time_ms={} detection={:?}",
+                            death.session_id,
+                            death.sequence,
+                            death.client_time_ms,
+                            death.detection
+                        ),
+                    }
                     self.last_bridge_event = Some(event.clone());
                     if let BridgeEvent::LocalPlayerDeath(death) = event {
                         self.queue_death_shock(death);
@@ -655,52 +853,110 @@ impl AppState {
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
+                    log::warn!(
+                        target: "companion::app",
+                        "bridge_subscription_failed reason=channel_closed"
+                    );
                     self.bridge_events = None;
                     break;
                 }
             }
         }
     }
+
     fn start_listener_from_input(&mut self) {
         let path = self.log_path.trim();
         if path.is_empty() {
+            log::warn!(target: "companion::app", "log_listener_start_skipped reason=empty_path");
             self.listener_action_error =
                 Some("Enter a console.log path before starting the listener.".to_owned());
             return;
         }
-        self.listener_action_error = self
-            .start_log_listener(PathBuf::from(path))
-            .err()
-            .map(|error| format!("Could not start listener: {error}"));
+        let path = PathBuf::from(path);
+        log::info!(
+            target: "companion::app",
+            "log_listener_manual_start path={:?}",
+            path
+        );
+        self.listener_action_error = self.start_log_listener(path.clone()).err().map(|error| {
+            log::warn!(
+                target: "companion::app",
+                "log_listener_manual_failed path={:?} error={:?}",
+                path,
+                error
+            );
+            format!("Could not start listener: {error}")
+        });
+        if self.listener_action_error.is_none() {
+            log::info!(
+                target: "companion::app",
+                "log_listener_manual_started path={:?}",
+                path
+            );
+        }
     }
+
     fn auto_detect_log_path(&mut self) {
         self.listener_action_error = None;
+        log::info!(target: "companion::app", "log_path_auto_detection_started");
         self.apply_log_detection(deadlock_path::detect());
     }
+
     fn apply_log_detection(&mut self, result: Result<Detection, DetectionError>) {
         match result {
             Ok(Detection::Ready { path }) => {
+                log::info!(
+                    target: "companion::app",
+                    "log_path_auto_detection_found path={:?}",
+                    path
+                );
                 self.log_path = path.display().to_string();
-                self.log_detection_status = match self.start_log_listener(path) {
+                self.log_detection_status = match self.start_log_listener(path.clone()) {
                     Ok(()) => Some(LogDetectionStatus::Found),
-                    Err(error) => Some(LogDetectionStatus::Failed(format!(
-                        "Deadlock console.log was found, but the listener could not start: {error}"
-                    ))),
+                    Err(error) => {
+                        log::warn!(
+                            target: "companion::app",
+                            "log_listener_auto_start_failed path={:?} error={:?}",
+                            path,
+                            error
+                        );
+                        Some(LogDetectionStatus::Failed(format!(
+                            "Deadlock console.log was found, but the listener could not start: {error}"
+                        )))
+                    }
                 };
             }
             Ok(Detection::NotCreated { path }) => {
+                log::info!(
+                    target: "companion::app",
+                    "log_path_auto_detection_not_created path={:?}",
+                    path
+                );
                 self.log_path = path.display().to_string();
-                self.log_detection_status = match self.start_log_listener(path) {
+                self.log_detection_status = match self.start_log_listener(path.clone()) {
                     Ok(()) => Some(LogDetectionStatus::NotCreated),
-                    Err(error) => Some(LogDetectionStatus::Failed(format!(
-                        "Deadlock was found, but the listener could not start: {error}"
-                    ))),
+                    Err(error) => {
+                        log::warn!(
+                            target: "companion::app",
+                            "log_listener_auto_start_failed path={:?} error={:?}",
+                            path,
+                            error
+                        );
+                        Some(LogDetectionStatus::Failed(format!(
+                            "Deadlock was found, but the listener could not start: {error}"
+                        )))
+                    }
                 };
             }
             Err(error) => {
+                log::warn!(
+                    target: "companion::app",
+                    "log_path_auto_detection_failed error={:?}",
+                    error
+                );
                 self.log_detection_status = Some(LogDetectionStatus::Failed(format!(
                     "Auto-detect failed: {error}"
-                )))
+                )));
             }
         }
     }
@@ -941,6 +1197,11 @@ impl CompanionApp {
         match default_state_path() {
             Ok(path) => Self::load_from_path(path),
             Err(error) => {
+                log::warn!(
+                    target: "companion::app",
+                    "settings_load_unavailable error={:?}",
+                    error
+                );
                 let (persistence, state) = Persistence::unavailable(error);
                 Self {
                     state: state.restore_app(),
@@ -984,9 +1245,13 @@ impl CompanionApp {
     }
 
     pub fn flush_pending(&mut self) {
-        let _ = self
+        log::info!(target: "companion::app", "settings_flush_boundary reason=application_exit");
+        let result = self
             .persistence
             .flush(PersistedState::from_app(&self.state));
+        if result.is_err() {
+            log::warn!(target: "companion::app", "settings_flush_boundary outcome=failed");
+        }
     }
 
     fn draw_menu(&mut self, ui: &mut Ui) {
@@ -1051,16 +1316,25 @@ impl CompanionApp {
     }
 
     fn reset_and_save(&mut self) -> bool {
+        log::info!(target: "companion::app", "settings_reset_requested");
         if !self.state.reset_saved_state() {
+            log::warn!(
+                target: "companion::app",
+                "settings_reset_outcome outcome=skipped"
+            );
             return false;
         }
-        let _ = self
+        let result = self
             .persistence
             .save_reset_now(PersistedState::from_app(&self.state));
+        log::info!(
+            target: "companion::app",
+            "settings_reset_outcome outcome=applied saved={}",
+            result.is_ok()
+        );
         true
     }
 }
-
 fn portable_intensity(value: f32) -> Option<u8> {
     (value.is_finite()
         && value.fract() == 0.0
@@ -1439,8 +1713,10 @@ mod tests {
         sound_busy.sound_result = Some(receiver);
         assert!(!sound_busy.reset_saved_state());
 
-        let mut shock_busy = AppState::default();
-        shock_busy.shock_in_flight = 1;
+        let mut shock_busy = AppState {
+            shock_in_flight: 1,
+            ..AppState::default()
+        };
         assert!(!shock_busy.reset_saved_state());
         assert_eq!(shock_busy.shock_in_flight, 1);
     }

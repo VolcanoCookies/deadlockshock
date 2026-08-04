@@ -175,7 +175,12 @@ impl ConsoleLogListener {
 
     pub fn subscribe(&self) -> Receiver<BridgeEvent> {
         let (sender, receiver) = mpsc::channel();
-        lock_unpoisoned(&self.subscribers).push(sender);
+        let count = {
+            let mut subscribers = lock_unpoisoned(&self.subscribers);
+            subscribers.push(sender);
+            subscribers.len()
+        };
+        log::debug!(target: "companion::bridge_listener", "listener_subscriber_added count={count}");
         receiver
     }
 
@@ -183,14 +188,35 @@ impl ConsoleLogListener {
         if self.worker.is_some()
             && lock_unpoisoned(&self.status).configured_path.as_ref() == Some(&path)
         {
+            log::debug!(
+                target: "companion::bridge_listener",
+                "listener_start_noop path={:?}",
+                path
+            );
             return Ok(());
         }
 
+        let restarting = self.worker.is_some();
+        if restarting {
+            log::info!(
+                target: "companion::bridge_listener",
+                "listener_restart path={:?}",
+                path
+            );
+        }
         self.stop();
         let (initial_log, skip_first_success) = match open_log_file(&path, true) {
             Ok(log) => (Some(log), false),
             Err(error) if error.kind() == io::ErrorKind::NotFound => (None, false),
-            Err(_) => (None, true),
+            Err(error) => {
+                log::debug!(
+                    target: "companion::bridge_listener",
+                    "listener_initial_open_deferred path={:?} error={:?}",
+                    path,
+                    error
+                );
+                (None, true)
+            }
         };
         let initial_phase = if initial_log.is_some() {
             ListenerPhase::Listening
@@ -205,6 +231,12 @@ impl ConsoleLogListener {
             status.last_activity_at = None;
             status.last_event_at = None;
         }
+        log::info!(
+            target: "companion::bridge_listener",
+            "listener_start path={:?} phase={:?}",
+            path,
+            initial_phase
+        );
 
         let status = Arc::clone(&self.status);
         let subscribers = Arc::clone(&self.subscribers);
@@ -229,6 +261,12 @@ impl ConsoleLogListener {
                 Ok(())
             }
             Err(error) => {
+                log::error!(
+                    target: "companion::bridge_listener",
+                    "listener_thread_spawn_failed path={:?} error={:?}",
+                    lock_unpoisoned(&self.status).configured_path,
+                    error
+                );
                 let mut status = lock_unpoisoned(&self.status);
                 status.phase = ListenerPhase::Failed;
                 status.current_error = Some(format!("could not start listener thread: {error}"));
@@ -238,6 +276,8 @@ impl ConsoleLogListener {
     }
 
     pub fn stop(&mut self) {
+        let had_worker = self.worker.is_some();
+        let previous_phase = lock_unpoisoned(&self.status).phase;
         if let Some(worker) = self.worker.take() {
             let _ = worker.stop.send(());
             let _ = worker.join.join();
@@ -245,6 +285,13 @@ impl ConsoleLogListener {
         let mut status = lock_unpoisoned(&self.status);
         status.phase = ListenerPhase::Stopped;
         status.current_error = None;
+        if had_worker || previous_phase != ListenerPhase::Stopped {
+            log::info!(
+                target: "companion::bridge_listener",
+                "listener_stop path={:?}",
+                status.configured_path
+            );
+        }
     }
 
     pub fn status(&self) -> ListenerStatus {
@@ -330,6 +377,11 @@ fn worker_loop(
                     None => false,
                 };
                 if replaced {
+                    log::info!(
+                        target: "companion::bridge_listener",
+                        "listener_log_replaced path={:?}",
+                        path
+                    );
                     open_log = None;
                 }
 
@@ -363,7 +415,13 @@ fn worker_loop(
                         )),
                     );
                 } else if let Some(log) = &mut open_log {
-                    match read_available(log, &mut read_buffer, &status, &subscribers) {
+                    match read_available(
+                        log,
+                        path_metadata.len(),
+                        &mut read_buffer,
+                        &status,
+                        &subscribers,
+                    ) {
                         Ok(()) => set_phase(&status, ListenerPhase::Listening, None),
                         Err(error) => {
                             set_phase(
@@ -405,6 +463,10 @@ fn open_log_file(path: &Path, skip_existing: bool) -> io::Result<OpenLog> {
 
 fn ensure_not_truncated(log: &mut OpenLog, path_len: u64) -> io::Result<()> {
     if path_len < log.offset || !checkpoint_matches(log)? {
+        log::info!(
+            target: "companion::bridge_listener",
+            "listener_log_reset reason=truncated_or_rewritten"
+        );
         reset_after_truncation(log)?;
     }
     Ok(())
@@ -457,12 +519,18 @@ fn update_checkpoint(checkpoint: &mut Vec<u8>, bytes: &[u8]) {
 
 fn read_available(
     log: &mut OpenLog,
+    available_len: u64,
     read_buffer: &mut [u8],
     status: &Arc<Mutex<ListenerStatus>>,
     subscribers: &Arc<Mutex<Vec<Sender<BridgeEvent>>>>,
 ) -> io::Result<()> {
     loop {
-        let bytes_read = log.file.read(read_buffer)?;
+        if log.offset >= available_len {
+            return Ok(());
+        }
+        let remaining = available_len - log.offset;
+        let read_len = remaining.min(read_buffer.len() as u64) as usize;
+        let bytes_read = log.file.read(&mut read_buffer[..read_len])?;
         if bytes_read == 0 {
             return Ok(());
         }
@@ -501,9 +569,26 @@ fn consume_bytes(
             let line = incomplete_line
                 .strip_suffix(b"\r")
                 .unwrap_or(incomplete_line.as_slice());
-            let event = std::str::from_utf8(line).ok().and_then(parse_bridge_record);
-            if let Some(event) = event {
-                deliver(event);
+            match std::str::from_utf8(line) {
+                Ok(line) => {
+                    if line.contains(BRIDGE_RECORD_PREFIX) {
+                        match parse_bridge_record(line) {
+                            Some(event) => deliver(event),
+                            None => log_rejected_bridge_record(line),
+                        }
+                    }
+                }
+                Err(_) => {
+                    if line
+                        .windows(BRIDGE_RECORD_PREFIX.len())
+                        .any(|window| window == BRIDGE_RECORD_PREFIX.as_bytes())
+                    {
+                        log::warn!(
+                            target: "companion::bridge_listener",
+                            "bridge_record_rejected reason=invalid_utf8"
+                        );
+                    }
+                }
             }
             incomplete_line.clear();
         } else if incomplete_line.len() < MAX_INCOMPLETE_LINE_BYTES {
@@ -511,20 +596,59 @@ fn consume_bytes(
         } else {
             incomplete_line.clear();
             *discarding_oversized_line = true;
+            log::warn!(
+                target: "companion::bridge_listener",
+                "bridge_record_discarded reason=oversized_line limit_bytes={MAX_INCOMPLETE_LINE_BYTES}"
+            );
         }
     }
 }
 
+fn log_rejected_bridge_record(line: &str) {
+    let Some(prefix_at) = line.find(BRIDGE_RECORD_PREFIX) else {
+        return;
+    };
+    let payload = &line[prefix_at + BRIDGE_RECORD_PREFIX.len()..];
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) else {
+        log::warn!(
+            target: "companion::bridge_listener",
+            "bridge_record_rejected reason=malformed"
+        );
+        return;
+    };
+    let event = value.get("event").and_then(serde_json::Value::as_str);
+    let schema = value.get("schema").and_then(serde_json::Value::as_u64);
+    let reason = if schema.is_some_and(|schema| schema != u64::from(BRIDGE_SCHEMA))
+        || !matches!(event, Some("hook_ready" | "local_player_death"))
+    {
+        "unsupported"
+    } else {
+        "malformed"
+    };
+    log::warn!(
+        target: "companion::bridge_listener",
+        "bridge_record_rejected reason={reason}"
+    );
+}
+
 fn broadcast(subscribers: &Arc<Mutex<Vec<Sender<BridgeEvent>>>>, event: BridgeEvent) -> bool {
     let mut delivered = false;
+    let mut stale = 0_usize;
     lock_unpoisoned(subscribers).retain(|subscriber| {
         if subscriber.send(event.clone()).is_ok() {
             delivered = true;
             true
         } else {
+            stale += 1;
             false
         }
     });
+    if stale > 0 {
+        log::debug!(
+            target: "companion::bridge_listener",
+            "listener_stale_subscribers_removed count={stale}"
+        );
+    }
     delivered
 }
 
@@ -534,8 +658,34 @@ fn set_phase(
     current_error: Option<String>,
 ) {
     let mut status = lock_unpoisoned(status);
+    let phase_changed = status.phase != phase;
+    let error_changed = status.current_error != current_error;
+    if !phase_changed && !error_changed {
+        return;
+    }
+    let previous_phase = status.phase;
     status.phase = phase;
-    status.current_error = current_error;
+    status.current_error = current_error.clone();
+    match phase {
+        ListenerPhase::Failed => log::warn!(
+            target: "companion::bridge_listener",
+            "listener_phase phase=failed error={:?}",
+            current_error
+        ),
+        ListenerPhase::Listening if previous_phase == ListenerPhase::Failed => log::info!(
+            target: "companion::bridge_listener",
+            "listener_recovered phase=listening"
+        ),
+        ListenerPhase::Listening => log::info!(
+            target: "companion::bridge_listener",
+            "listener_phase phase=listening"
+        ),
+        ListenerPhase::WaitingForFile => log::info!(
+            target: "companion::bridge_listener",
+            "listener_phase phase=waiting_for_file"
+        ),
+        ListenerPhase::Stopped => {}
+    }
 }
 
 fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
