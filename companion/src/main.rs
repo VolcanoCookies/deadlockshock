@@ -25,6 +25,21 @@ fn init_logging() {
     .init();
 }
 
+fn app_icon() -> egui::IconData {
+    let image = image::load_from_memory_with_format(
+        include_bytes!("../assets/logo.png"),
+        image::ImageFormat::Png,
+    )
+    .expect("embedded application icon must be a valid PNG image")
+    .into_rgba8();
+
+    egui::IconData {
+        width: image.width(),
+        height: image.height(),
+        rgba: image.into_raw(),
+    }
+}
+
 fn main() -> eframe::Result {
     init_logging();
     log::info!(
@@ -37,14 +52,15 @@ fn main() -> eframe::Result {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("Companion")
+            .with_title("DeadlockShock Companion")
             .with_inner_size([380.0, 620.0])
-            .with_min_inner_size([340.0, 540.0]),
+            .with_min_inner_size([340.0, 540.0])
+            .with_icon(app_icon()),
         ..Default::default()
     };
 
     let result = eframe::run_native(
-        "Companion",
+        "DeadlockShock Companion",
         options,
         Box::new(|_creation_context| Ok(Box::new(CompanionApp::load()))),
     );

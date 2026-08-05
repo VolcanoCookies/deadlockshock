@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 eframe = { version = "0.35", default-features = false, features = ["default_fonts", "glow", "x11"] }
 egui = "0.35"
+image = { version = "0.25", default-features = false, features = ["png"] }
 pishock = { path = "../pishock" }
 openshock = { path = "../openshock" }
 steamlocate = "2.1"
