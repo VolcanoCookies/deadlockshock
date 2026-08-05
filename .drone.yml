@@ -23,19 +23,23 @@ steps:
 
   - name: build-windows
     image: rust:1.97-bookworm
+    environment:
+      CARGO_TARGET_DIR: companion/target/drone-windows
     commands:
       - apt-get update && apt-get install -y --no-install-recommends gcc-mingw-w64-x86-64
       - rustup target add x86_64-pc-windows-gnu
       - cargo build --locked --release --target x86_64-pc-windows-gnu --manifest-path companion/Cargo.toml
       - mkdir -p dist
-      - cp companion/target/x86_64-pc-windows-gnu/release/companion.exe "dist/deadlock-shock-${DRONE_TAG}-windows-x86_64.exe"
+      - cp companion/target/drone-windows/x86_64-pc-windows-gnu/release/companion.exe "dist/deadlock-shock-${DRONE_TAG}-windows-x86_64.exe"
 
   - name: build-linux
     image: rust:1.97-bullseye
+    environment:
+      CARGO_TARGET_DIR: companion/target/drone-linux
     commands:
       - cargo build --locked --release --manifest-path companion/Cargo.toml
       - mkdir -p dist
-      - tar -C companion/target/release --transform='s/^companion$/deadlock-shock/' -czf "dist/deadlock-shock-${DRONE_TAG}-linux-x86_64.tar.gz" companion
+      - tar -C companion/target/drone-linux/release --transform='s/^companion$/deadlock-shock/' -czf "dist/deadlock-shock-${DRONE_TAG}-linux-x86_64.tar.gz" companion
 
   - name: publish
     image: plugins/github-release
