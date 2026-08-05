@@ -35,3 +35,12 @@ cargo run --manifest-path companion/Cargo.toml --release
 Pick PiShock or OpenShock, enter your credentials, choose a device group, and try the test sound. Set the intensity and duration you want, then auto-detect `console.log` and start the listener. From there, every new local-player death shocks the available shockers in that group.
 
 The companion remembers your setup—including credentials—in your OS user config directory.
+
+## Publishing a release
+
+The Drone repository needs a `github-token` secret with permission to create releases in this GitHub repository. Push a version tag to start the release pipeline:
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0
+```
