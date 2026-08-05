@@ -36,6 +36,7 @@ impl LegacyClient {
         sender: String,
         base_url: String,
     ) -> Result<Self, Error> {
+        let sender = sender.trim().to_owned();
         validate_credentials(&credentials, &sender)?;
         Ok(Self {
             http: build_http_client()?,
@@ -45,12 +46,11 @@ impl LegacyClient {
         })
     }
 
-    /// Gets share limits and status for a legacy share code.
     pub fn get_shocker_info(&self, share_code: &str) -> Result<ShockerInfo, Error> {
-        validate_share_code(share_code)?;
+        let share_code = normalize_share_code(share_code)?;
         let request = ShockerInfoRequest {
             username: &self.credentials.username,
-            code: share_code,
+            code: &share_code,
             api_key: &self.credentials.api_key,
         };
         let response = self
@@ -68,7 +68,7 @@ impl LegacyClient {
 
     /// Sends one command request to a legacy share-code target.
     pub fn send_command(&self, share_code: &str, command: Command) -> Result<(), Error> {
-        validate_share_code(share_code)?;
+        let share_code = normalize_share_code(share_code)?;
         validate_command(command)?;
         let (operation, intensity, duration) = match command {
             Command::Shock {
@@ -84,7 +84,7 @@ impl LegacyClient {
         let request = OperationRequest {
             username: &self.credentials.username,
             name: &self.sender,
-            code: share_code,
+            code: &share_code,
             intensity,
             duration,
             api_key: &self.credentials.api_key,
@@ -129,11 +129,12 @@ impl LegacyClient {
     }
 }
 
-fn validate_share_code(share_code: &str) -> Result<(), Error> {
-    if share_code.trim().is_empty() {
+fn normalize_share_code(share_code: &str) -> Result<String, Error> {
+    let share_code = share_code.trim();
+    if share_code.is_empty() {
         Err(Error::EmptyShareCode)
     } else {
-        Ok(())
+        Ok(share_code.to_owned())
     }
 }
 

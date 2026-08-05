@@ -151,12 +151,6 @@ pub(crate) fn detect_in_roots(roots: &[PathBuf]) -> Result<Detection, DetectionE
     if !readable_root_found {
         return Err(first_unreadable.unwrap_or(DetectionError::SteamNotFound));
     }
-    if let Some(error) = first_malformed {
-        return Err(error);
-    }
-    if let Some(error) = first_unreadable {
-        return Err(error);
-    }
 
     let libraries = deduplicate_paths(libraries);
     log::debug!(
@@ -172,10 +166,11 @@ pub(crate) fn detect_in_roots(roots: &[PathBuf]) -> Result<Detection, DetectionE
         let library = match steamlocate::Library::from_dir(&library_path) {
             Ok(library) => library,
             Err(error) => {
-                return Err(DetectionError::SteamUnreadable {
-                    path: library_path,
+                first_unreadable.get_or_insert_with(|| DetectionError::SteamUnreadable {
+                    path: library_path.clone(),
                     details: error.to_string(),
                 });
+                continue;
             }
         };
 
@@ -187,16 +182,23 @@ pub(crate) fn detect_in_roots(roots: &[PathBuf]) -> Result<Detection, DetectionE
             .path()
             .join("steamapps")
             .join(format!("appmanifest_{DEADLOCK_APP_ID}.acf"));
-        let app = app.map_err(|error| DetectionError::MalformedMetadata {
+        let app = match app.map_err(|error| DetectionError::MalformedMetadata {
             path: manifest_path.clone(),
             details: error.to_string(),
-        })?;
+        }) {
+            Ok(app) => app,
+            Err(error) => {
+                first_malformed.get_or_insert(error);
+                continue;
+            }
+        };
 
         if app.app_id != DEADLOCK_APP_ID || !is_safe_install_dir(&app.install_dir) {
-            return Err(DetectionError::MalformedMetadata {
+            first_malformed.get_or_insert_with(|| DetectionError::MalformedMetadata {
                 path: manifest_path,
                 details: "appid or installdir does not match the manifest location".to_owned(),
             });
+            continue;
         }
 
         let install_path = library.resolve_app_dir(&app);
@@ -212,35 +214,39 @@ pub(crate) fn detect_in_roots(roots: &[PathBuf]) -> Result<Detection, DetectionE
                 continue;
             }
             Err(error) => {
-                return Err(DetectionError::SteamUnreadable {
+                first_unreadable.get_or_insert_with(|| DetectionError::SteamUnreadable {
                     path: game_path,
                     details: error.to_string(),
                 });
+                continue;
             }
         }
 
         let log_path = install_path.join(DEADLOCK_LOG_RELATIVE_PATH);
-        let modified =
-            match fs::metadata(&log_path) {
-                Ok(metadata) if metadata.is_file() => Some(metadata.modified().map_err(
-                    |error| DetectionError::SteamUnreadable {
+        let modified = match fs::metadata(&log_path) {
+            Ok(metadata) if metadata.is_file() => match metadata.modified() {
+                Ok(modified) => Some(modified),
+                Err(error) => {
+                    first_unreadable.get_or_insert_with(|| DetectionError::SteamUnreadable {
                         path: log_path.clone(),
                         details: format!("could not read log modification time: {error}"),
-                    },
-                )?),
-                Ok(_) => {
-                    return Err(DetectionError::InvalidInstall {
-                        paths: vec![install_path],
                     });
+                    continue;
                 }
-                Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-                Err(error) => {
-                    return Err(DetectionError::SteamUnreadable {
-                        path: log_path,
-                        details: error.to_string(),
-                    });
-                }
-            };
+            },
+            Ok(_) => {
+                invalid_installs.push(install_path);
+                continue;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => {
+                first_unreadable.get_or_insert_with(|| DetectionError::SteamUnreadable {
+                    path: log_path,
+                    details: error.to_string(),
+                });
+                continue;
+            }
+        };
         candidates.push(Candidate {
             path: log_path,
             modified,
@@ -255,17 +261,21 @@ pub(crate) fn detect_in_roots(roots: &[PathBuf]) -> Result<Detection, DetectionE
         candidates.len(),
         invalid_installs.len()
     );
-    if candidates.is_empty() {
-        return if manifest_found {
-            Err(DetectionError::InvalidInstall {
-                paths: invalid_installs,
-            })
-        } else {
-            Err(DetectionError::DeadlockNotInstalled)
-        };
+    if !candidates.is_empty() {
+        return select_candidate(candidates);
     }
-
-    select_candidate(candidates)
+    if let Some(error) = first_malformed {
+        return Err(error);
+    }
+    if let Some(error) = first_unreadable {
+        return Err(error);
+    }
+    if manifest_found {
+        return Err(DetectionError::InvalidInstall {
+            paths: invalid_installs,
+        });
+    }
+    Err(DetectionError::DeadlockNotInstalled)
 }
 
 fn select_candidate(mut candidates: Vec<Candidate>) -> Result<Detection, DetectionError> {
@@ -666,6 +676,50 @@ mod tests {
         assert!(matches!(
             detect_in_roots(std::slice::from_ref(&steam.root)),
             Err(DetectionError::MalformedMetadata { path, .. }) if path == manifest
+        ));
+    }
+    #[test]
+    fn broken_root_does_not_hide_valid_root() {
+        let steam = TestSteam::new(1);
+        let expected = steam.install(0, "Deadlock", true);
+        let broken_root = steam._temp.path().join("not-a-steam-directory");
+        File::create(&broken_root).expect("create broken root");
+
+        assert_eq!(
+            detect_in_roots(&[broken_root, steam.root]),
+            Ok(Detection::Ready { path: expected })
+        );
+    }
+
+    #[test]
+    fn broken_library_does_not_hide_valid_library() {
+        let steam = TestSteam::new(3);
+        let broken_library = steam.library(1);
+        fs::remove_dir_all(&broken_library).expect("remove broken library");
+        File::create(&broken_library).expect("create broken library");
+        let expected = steam.install(2, "Deadlock", true);
+
+        assert_eq!(
+            detect_in_roots(std::slice::from_ref(&steam.root)),
+            Ok(Detection::Ready { path: expected })
+        );
+    }
+
+    #[test]
+    fn malformed_metadata_precedes_other_accumulated_errors() {
+        let steam = TestSteam::new(2);
+        let malformed_manifest = steam
+            .root
+            .join("steamapps")
+            .join(format!("appmanifest_{DEADLOCK_APP_ID}.acf"));
+        fs::write(&malformed_manifest, "not vdf").expect("write malformed manifest");
+        let broken_library = steam.library(1);
+        fs::remove_dir_all(&broken_library).expect("remove broken library");
+        File::create(&broken_library).expect("create broken library");
+
+        assert!(matches!(
+            detect_in_roots(std::slice::from_ref(&steam.root)),
+            Err(DetectionError::MalformedMetadata { path, .. }) if path == malformed_manifest
         ));
     }
 

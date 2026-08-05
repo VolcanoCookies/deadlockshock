@@ -19,6 +19,7 @@ use url::Url;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const MIN_DURATION_MS: u64 = 300;
 const MAX_DURATION_MS: u64 = 65_535;
 const RECORD_SEPARATOR: char = '\u{1e}';
@@ -32,7 +33,7 @@ pub struct Credentials {
 impl Credentials {
     pub fn new(token: impl Into<String>) -> Self {
         Self {
-            token: token.into(),
+            token: token.into().trim().to_owned(),
         }
     }
     pub fn token(&self) -> &str {
@@ -149,6 +150,7 @@ impl OpenShockClient {
         sender: String,
         endpoints: Endpoints,
     ) -> Result<Self, Error> {
+        let sender = sender.trim().to_owned();
         validate_credentials(&credentials, &sender)?;
         let http = build_http_client()?;
         preflight_with(&http, &credentials, &endpoints)?;
@@ -254,12 +256,9 @@ impl Worker {
             Err(Error::Transport | Error::Disconnected | Error::Handshake)
         ) {
             // A failed completion is ambiguous: the device may have received the
-            // command before the connection dropped. Reconnect for the next
-            // command, but never replay a physical-control invocation.
+            // command before the connection dropped. Clear the socket so the
+            // next command reconnects, but never replay this invocation.
             self.socket = None;
-            if let Ok(socket) = open_socket(&self.credentials, &self.endpoints) {
-                self.socket = Some(socket);
-            }
         }
         result
     }
@@ -404,10 +403,10 @@ fn open_socket(credentials: &Credentials, endpoints: &Endpoints) -> Result<Socke
         .find_map(|address| TcpStream::connect_timeout(&address, CONNECT_TIMEOUT).ok())
         .ok_or(Error::Transport)?;
     stream
-        .set_read_timeout(Some(REQUEST_TIMEOUT))
+        .set_read_timeout(Some(COMMAND_TIMEOUT))
         .map_err(|_| Error::Transport)?;
     stream
-        .set_write_timeout(Some(REQUEST_TIMEOUT))
+        .set_write_timeout(Some(COMMAND_TIMEOUT))
         .map_err(|_| Error::Transport)?;
     let mut request = endpoints
         .websocket
@@ -491,11 +490,18 @@ fn decode_token(value: Value) -> Result<TokenInfo, Error> {
     let object = object.as_object().ok_or(Error::Decode {
         operation: "token authentication",
     })?;
-    let paused = object
+    let control = object
         .get("shockerControl")
-        .and_then(|control| control.get("paused"))
+        .and_then(Value::as_object)
+        .ok_or(Error::Decode {
+            operation: "token authentication",
+        })?;
+    let paused = control
+        .get("paused")
         .and_then(Value::as_bool)
-        .unwrap_or(false);
+        .ok_or(Error::Decode {
+            operation: "token authentication",
+        })?;
     let permissions = object
         .get("permissions")
         .map(flatten_permissions)
@@ -505,7 +511,6 @@ fn decode_token(value: Value) -> Result<TokenInfo, Error> {
         permissions,
     })
 }
-
 fn flatten_permissions(value: &Value) -> Vec<String> {
     let mut result = Vec::new();
     match value {
@@ -589,9 +594,11 @@ fn decode_groups(value: Value) -> Result<Vec<DeviceGroup>, Error> {
                     .to_owned();
                 let paused = object
                     .get("paused")
-                    .or_else(|| object.get("isPaused"))
                     .and_then(Value::as_bool)
-                    .unwrap_or(false);
+                    .or_else(|| object.get("isPaused").and_then(Value::as_bool))
+                    .ok_or(Error::Decode {
+                        operation: "device listing",
+                    })?;
                 Ok(Shocker { id, name, paused })
             })
             .collect::<Result<Vec<_>, Error>>()?;
@@ -784,7 +791,62 @@ mod tests {
         assert_eq!(groups[0].shockers[0].id, "s");
         assert!(groups[0].shockers[0].paused);
     }
+    #[test]
+    fn token_decoder_requires_boolean_pause_state() {
+        for value in [
+            json!({"data":{"permissions":[]}}),
+            json!({"data":{"shockerControl":{}}}),
+            json!({"data":{"shockerControl":{"paused":null}}}),
+            json!({"data":{"shockerControl":{"paused":"false"}}}),
+        ] {
+            assert_eq!(
+                decode_token(value),
+                Err(Error::Decode {
+                    operation: "token authentication"
+                })
+            );
+        }
+    }
 
+    #[test]
+    fn group_decoder_accepts_both_pause_spellings_and_rejects_invalid_state() {
+        for (key, pause) in [("paused", true), ("isPaused", false)] {
+            let mut value = json!({
+                "data": [{
+                    "id": "g",
+                    "name": "Group",
+                    "shockers": [{"id": "s", "name": "S"}]
+                }]
+            });
+            value["data"][0]["shockers"][0][key] = json!(pause);
+            let groups = decode_groups(value).expect("groups");
+            assert_eq!(groups[0].shockers[0].paused, pause);
+        }
+        for pause in [
+            json!({}),
+            json!({"paused": null}),
+            json!({"isPaused": "false"}),
+        ] {
+            let mut payload = json!({
+                "data": [{
+                    "id": "g",
+                    "name": "Group",
+                    "shockers": [{"id": "s", "name": "S"}]
+                }]
+            });
+            if let Some(object) = pause.as_object() {
+                for (key, pause_value) in object {
+                    payload["data"][0]["shockers"][0][key] = pause_value.clone();
+                }
+            }
+            assert_eq!(
+                decode_groups(payload),
+                Err(Error::Decode {
+                    operation: "device listing"
+                })
+            );
+        }
+    }
     #[test]
     fn token_decoder_checks_nested_pause_state() {
         let value = json!({"data":{"id":"t","permissions":["shockers.use"],"shockerControl":{"paused":true}}});
@@ -927,8 +989,8 @@ mod tests {
             .expect(1)
             .create();
         let client = OpenShockClient::connect_to(
-            Credentials::new(TOKEN),
-            SENDER.to_owned(),
+            Credentials::new(" \topen-shock-secret \n"),
+            " \tdeadlockshock-companion \n".to_owned(),
             endpoints(server.url(), format!("ws://{address}/1/hubs/user")),
         )
         .expect("connect OpenShock client");
@@ -955,48 +1017,36 @@ mod tests {
     }
 
     #[test]
-    fn ambiguous_transport_failure_reconnects_without_replaying_command() {
+    fn ambiguous_transport_failure_clears_socket_without_replaying_command() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind websocket server");
-        let address = listener.local_addr().expect("websocket address");
+        let address = listener.local_addr().expect("local address");
         let websocket = thread::spawn(move || {
-            let mut invocation = None;
-            for connection_index in 0..2 {
-                let (stream, _) = listener.accept().expect("accept websocket client");
-                let mut socket = tungstenite::accept(stream).expect("upgrade websocket");
-                let handshake = text(socket.read().expect("read SignalR handshake"));
-                assert!(handshake.ends_with(RECORD_SEPARATOR));
-                socket
-                    .send(Message::Text("{}\u{1e}".into()))
-                    .expect("complete SignalR handshake");
-
-                if connection_index == 0 {
-                    let frame = text(socket.read().expect("read ControlV2 invocation"));
-                    invocation = Some(
-                        serde_json::from_str::<Value>(frame.trim_end_matches(RECORD_SEPARATOR))
-                            .expect("decode ControlV2 invocation"),
-                    );
-                    drop(socket);
-                } else {
-                    assert!(matches!(
-                        socket.read().expect("read close without replay"),
-                        Message::Close(_)
-                    ));
-                }
-            }
-            invocation.expect("one invocation")
+            let (stream, _) = listener.accept().expect("accept websocket client");
+            let mut socket = tungstenite::accept(stream).expect("upgrade websocket");
+            let handshake = text(socket.read().expect("read SignalR handshake"));
+            assert!(handshake.ends_with(RECORD_SEPARATOR));
+            socket
+                .send(Message::Text("{}\u{1e}".into()))
+                .expect("complete SignalR handshake");
+            let frame = text(socket.read().expect("read ControlV2 invocation"));
+            let invocation =
+                serde_json::from_str::<Value>(frame.trim_end_matches(RECORD_SEPARATOR))
+                    .expect("decode ControlV2 invocation");
+            drop(socket);
+            invocation
         });
 
         let mut server = Server::new();
         let token = server
-            .mock("GET", "/2/tokens/self")
-            .match_header("open-shock-token", TOKEN)
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(
-                r#"{"id":"token","permissions":["shockers.use"],"shockerControl":{"paused":false}}"#,
-            )
-            .expect(1)
-            .create();
+        .mock("GET", "/2/tokens/self")
+        .match_header("open-shock-token", TOKEN)
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"id":"token","permissions":["shockers.use"],"shockerControl":{"paused":false}}"#,
+        )
+        .expect(1)
+        .create();
         let client = OpenShockClient::connect_to(
             Credentials::new(TOKEN),
             SENDER.to_owned(),
@@ -1014,7 +1064,8 @@ mod tests {
         };
 
         assert_eq!(client.shock(&group, 42, 1_000), Err(Error::Transport));
-        client.disconnect().expect("disconnect reconnected client");
+        assert!(client.worker.lock().expect("worker lock").socket.is_none());
+        client.disconnect().expect("disconnect without reconnect");
         let invocation = websocket.join().expect("join websocket server");
         assert_eq!(invocation["arguments"][0].as_array().map(Vec::len), Some(1));
         token.assert();

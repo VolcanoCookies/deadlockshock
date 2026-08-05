@@ -97,6 +97,29 @@ fn credentials_debug_redacts_api_key() {
     assert!(rendered.contains("[REDACTED]"));
     assert!(!rendered.contains(API_KEY));
 }
+#[test]
+fn credentials_trim_boundary_values_and_sender_names() {
+    let credentials = Credentials::new(" \tapi-user\n", "\tsuper-secret-key \n");
+    assert_eq!(credentials.username, USERNAME);
+    assert_eq!(credentials.api_key, API_KEY);
+    let rendered = format!("{credentials:?}");
+    assert!(!rendered.contains(API_KEY));
+
+    let mut server = Server::new();
+    let authentication = auth_mock(&mut server);
+    let url = server.url();
+    let _client = WebSocketClient::connect_to(
+        credentials,
+        " \t desktop-companion \n".into(),
+        websocket::WebSocketUrls {
+            auth: url.clone(),
+            platform: url.clone(),
+            websocket: url,
+        },
+    )
+    .unwrap();
+    authentication.assert();
+}
 
 #[test]
 fn legacy_client_validates_credentials_when_constructed() {
@@ -113,6 +136,16 @@ fn legacy_client_validates_credentials_when_constructed() {
         Some(Error::EmptySender)
     );
     assert!(LegacyClient::new(credentials(), SENDER).is_ok());
+}
+#[test]
+fn whitespace_only_share_codes_are_rejected_before_requests() {
+    let server = Server::new();
+    let client = legacy_client(&server);
+    assert_eq!(client.get_shocker_info(" \t\n"), Err(Error::EmptyShareCode));
+    assert_eq!(
+        client.send_command(" \t\n", Command::Beep { duration: 1 }),
+        Err(Error::EmptyShareCode)
+    );
 }
 
 #[test]
@@ -167,6 +200,7 @@ fn get_shocker_info_uses_pascal_request_and_parses_camel_response() {
     let mut server = Server::new();
     let client = legacy_client(&server);
     let info_request = server
+
         .mock("POST", "/api/GetShockerInfo")
         .match_header("content-type", Matcher::Regex("^application/json".into()))
         .match_body(Matcher::JsonString(format!(r#"{{"Username":"{USERNAME}","Code":"{SHARE_CODE}","Apikey":"{API_KEY}"}}"#)))
@@ -191,6 +225,26 @@ fn get_shocker_info_uses_pascal_request_and_parses_camel_response() {
             online: None,
         }
     );
+}
+#[test]
+fn legacy_requests_emit_trimmed_credentials_sender_and_share_code() {
+    let mut server = Server::new();
+    let client = LegacyClient::new_to(
+        Credentials::new(" \tapi-user\n", "\tsuper-secret-key \n"),
+        " \t desktop-companion \n".into(),
+        server.url(),
+    )
+    .unwrap();
+    let request = operation_mock(
+        &mut server,
+        &format!(
+            r#"{{"Username":"{USERNAME}","Name":"{SENDER}","Code":"{SHARE_CODE}","Intensity":25,"Duration":3,"Apikey":"{API_KEY}","Op":0}}"#
+        ),
+        legacy::OPERATION_SUCCEEDED,
+    );
+
+    client.shock("\t SHARE-CODE \n", 25, 3).unwrap();
+    request.assert();
 }
 
 #[test]

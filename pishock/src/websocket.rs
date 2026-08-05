@@ -8,7 +8,7 @@ use tungstenite::{Message, client_tls_with_config};
 use url::Url;
 
 use crate::{
-    CONNECT_TIMEOUT, Credentials, Device, Error, REQUEST_TIMEOUT, Shocker, build_http_client,
+    COMMAND_TIMEOUT, CONNECT_TIMEOUT, Credentials, Device, Error, Shocker, build_http_client,
     expect_status, redact_api_key, validate_credentials, validate_duration,
 };
 
@@ -41,6 +41,7 @@ impl WebSocketClient {
         sender: String,
         urls: WebSocketUrls,
     ) -> Result<Self, Error> {
+        let sender = sender.trim().to_owned();
         validate_credentials(&credentials, &sender)?;
         let http = build_http_client()?;
         let response = http
@@ -183,10 +184,10 @@ impl WebSocketClient {
             .map_err(|_| Error::Transport)?;
         let stream = connect_with_timeout(addresses)?;
         stream
-            .set_read_timeout(Some(REQUEST_TIMEOUT))
+            .set_read_timeout(Some(COMMAND_TIMEOUT))
             .map_err(|_| Error::Transport)?;
         stream
-            .set_write_timeout(Some(REQUEST_TIMEOUT))
+            .set_write_timeout(Some(COMMAND_TIMEOUT))
             .map_err(|_| Error::Transport)?;
 
         let request = url

@@ -1,7 +1,7 @@
 use std::ops::RangeInclusive;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -20,6 +20,8 @@ pub const MIN_SHOCK_INTENSITY: f32 = 1.0;
 pub const MAX_SHOCK_INTENSITY: f32 = 100.0;
 pub const MIN_SHOCK_DURATION: f32 = 0.3;
 pub const MAX_SHOCK_DURATION: f32 = 3.0;
+pub(crate) const SHOCK_QUEUE_CAPACITY: usize = 10;
+pub(crate) const MAX_SHOCK_QUEUE_AGE: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum CredentialState {
@@ -144,11 +146,28 @@ struct ShockRequest {
 struct ShockJob {
     client: Arc<ConnectedProvider>,
     request: ShockRequest,
+    queued_at: Instant,
+}
+
+#[derive(Debug)]
+enum ShockCompletionResult {
+    Completed(Result<(), ProviderError>),
+    Skipped { reason: &'static str },
 }
 
 struct ShockCompletion {
     request: ShockRequest,
-    result: Result<(), ProviderError>,
+    result: ShockCompletionResult,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ShockEnqueueResult {
+    Accepted,
+    Full,
+    Disconnected,
+}
+
+fn shock_job_expired_at(queued_at: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(queued_at) >= MAX_SHOCK_QUEUE_AGE
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -220,17 +239,23 @@ impl ShockStatus {
     }
 }
 
-fn spawn_shock_worker() -> (Sender<ShockJob>, Receiver<ShockCompletion>) {
-    let (job_sender, job_receiver) = mpsc::channel::<ShockJob>();
+fn spawn_shock_worker() -> (SyncSender<ShockJob>, Receiver<ShockCompletion>) {
+    let (job_sender, job_receiver) = mpsc::sync_channel::<ShockJob>(SHOCK_QUEUE_CAPACITY);
     let (completion_sender, completion_receiver) = mpsc::channel::<ShockCompletion>();
     thread::spawn(move || {
         while let Ok(job) = job_receiver.recv() {
-            let result = match (job.request.target.as_ref(), job.request.resolved) {
-                (Some(target), Some(resolved)) => {
-                    job.client
-                        .shock(target, resolved.intensity, resolved.duration_ms)
-                }
-                _ => Err(ProviderError::NotConnected),
+            let result = if shock_job_expired_at(job.queued_at, Instant::now()) {
+                ShockCompletionResult::Skipped { reason: "expired" }
+            } else {
+                ShockCompletionResult::Completed(
+                    match (job.request.target.as_ref(), job.request.resolved) {
+                        (Some(target), Some(resolved)) => {
+                            job.client
+                                .shock(target, resolved.intensity, resolved.duration_ms)
+                        }
+                        _ => Err(ProviderError::NotConnected),
+                    },
+                )
             };
             let _ = completion_sender.send(ShockCompletion {
                 request: job.request,
@@ -263,7 +288,7 @@ pub struct AppState {
     connection_result: Option<Receiver<ConnectionResult>>,
     sound_result: Option<Receiver<SoundResult>>,
     sound_status: Option<SoundStatus>,
-    shock_sender: Sender<ShockJob>,
+    shock_sender: SyncSender<ShockJob>,
     shock_result: Receiver<ShockCompletion>,
     shock_in_flight: usize,
     shock_status: Option<ShockStatus>,
@@ -651,7 +676,24 @@ impl AppState {
                 Ok(completion) => {
                     self.shock_in_flight = self.shock_in_flight.saturating_sub(1);
                     match completion.result {
-                        Ok(()) => {
+                        ShockCompletionResult::Skipped { reason } => {
+                            log::warn!(
+                                target: "companion::app",
+                                "shock_skipped provider={} target={:?} intensity={:?} duration_ms={:?} session_id={:?} sequence={} reason={}",
+                                completion.request.provider.label(),
+                                completion.request.target.as_ref().map(ProviderTarget::id),
+                                completion.request.resolved.map(|resolved| resolved.intensity),
+                                completion.request.resolved.map(|resolved| resolved.duration_ms),
+                                completion.request.death.session_id,
+                                completion.request.death.sequence,
+                                reason
+                            );
+                            self.shock_status = Some(ShockStatus::Skipped {
+                                request: completion.request,
+                                reason: reason.to_owned(),
+                            });
+                        }
+                        ShockCompletionResult::Completed(Ok(())) => {
                             log::info!(
                                 target: "companion::app",
                                 "shock_sent provider={} target={:?} intensity={:?} duration_ms={:?} session_id={:?} sequence={}",
@@ -664,7 +706,7 @@ impl AppState {
                             );
                             self.shock_status = Some(ShockStatus::Sent(completion.request));
                         }
-                        Err(error) => {
+                        ShockCompletionResult::Completed(Err(error)) => {
                             log::warn!(
                                 target: "companion::app",
                                 "shock_failed provider={} target={:?} intensity={:?} duration_ms={:?} session_id={:?} sequence={} error_kind={}",
@@ -712,6 +754,57 @@ impl AppState {
         }
         self.last_death = Some((death.session_id.clone(), death.sequence));
         true
+    }
+
+    fn apply_shock_enqueue_result(&mut self, request: ShockRequest, result: ShockEnqueueResult) {
+        match result {
+            ShockEnqueueResult::Accepted => {
+                self.shock_status = Some(ShockStatus::Sending(request.clone()));
+                self.shock_in_flight = self.shock_in_flight.saturating_add(1);
+                log::info!(
+                    target: "companion::app",
+                    "shock_queued provider={} target={:?} intensity={:?} duration_ms={:?} session_id={:?} sequence={}",
+                    request.provider.label(),
+                    request.target.as_ref().map(ProviderTarget::id),
+                    request.resolved.map(|resolved| resolved.intensity),
+                    request.resolved.map(|resolved| resolved.duration_ms),
+                    request.death.session_id,
+                    request.death.sequence
+                );
+            }
+            ShockEnqueueResult::Full => {
+                log::warn!(
+                    target: "companion::app",
+                    "shock_skipped provider={} target={:?} intensity={:?} duration_ms={:?} session_id={:?} sequence={} reason=queue_capacity",
+                    request.provider.label(),
+                    request.target.as_ref().map(ProviderTarget::id),
+                    request.resolved.map(|resolved| resolved.intensity),
+                    request.resolved.map(|resolved| resolved.duration_ms),
+                    request.death.session_id,
+                    request.death.sequence
+                );
+                self.shock_status = Some(ShockStatus::Skipped {
+                    request,
+                    reason: "shock queue is full".to_owned(),
+                });
+            }
+            ShockEnqueueResult::Disconnected => {
+                log::error!(
+                    target: "companion::app",
+                    "shock_failed provider={} target={:?} intensity={:?} duration_ms={:?} session_id={:?} sequence={} reason=worker_unavailable",
+                    request.provider.label(),
+                    request.target.as_ref().map(ProviderTarget::id),
+                    request.resolved.map(|resolved| resolved.intensity),
+                    request.resolved.map(|resolved| resolved.duration_ms),
+                    request.death.session_id,
+                    request.death.sequence
+                );
+                self.shock_status = Some(ShockStatus::Failed {
+                    request,
+                    error: "shock worker is unavailable".to_owned(),
+                });
+            }
+        }
     }
 
     fn queue_death_shock(&mut self, death: LocalPlayerDeath) {
@@ -777,43 +870,17 @@ impl AppState {
             });
             return;
         }
-        self.shock_status = Some(ShockStatus::Sending(request.clone()));
-        self.shock_in_flight = self.shock_in_flight.saturating_add(1);
-        if self
-            .shock_sender
-            .send(ShockJob {
-                client,
-                request: request.clone(),
-            })
-            .is_err()
-        {
-            log::error!(
-                target: "companion::app",
-                "shock_failed provider={} target={:?} intensity={:?} duration_ms={:?} session_id={:?} sequence={} reason=worker_unavailable",
-                request.provider.label(),
-                request.target.as_ref().map(ProviderTarget::id),
-                request.resolved.map(|resolved| resolved.intensity),
-                request.resolved.map(|resolved| resolved.duration_ms),
-                request.death.session_id,
-                request.death.sequence
-            );
-            self.shock_in_flight = self.shock_in_flight.saturating_sub(1);
-            self.shock_status = Some(ShockStatus::Failed {
-                request,
-                error: "shock worker is unavailable".to_owned(),
-            });
-        } else {
-            log::info!(
-                target: "companion::app",
-                "shock_queued provider={} target={:?} intensity={:?} duration_ms={:?} session_id={:?} sequence={}",
-                request.provider.label(),
-                request.target.as_ref().map(ProviderTarget::id),
-                request.resolved.map(|resolved| resolved.intensity),
-                request.resolved.map(|resolved| resolved.duration_ms),
-                request.death.session_id,
-                request.death.sequence
-            );
-        }
+        let queued_at = Instant::now();
+        let enqueue_result = match self.shock_sender.try_send(ShockJob {
+            client,
+            request: request.clone(),
+            queued_at,
+        }) {
+            Ok(()) => ShockEnqueueResult::Accepted,
+            Err(TrySendError::Full(_job)) => ShockEnqueueResult::Full,
+            Err(TrySendError::Disconnected(_job)) => ShockEnqueueResult::Disconnected,
+        };
+        self.apply_shock_enqueue_result(request, enqueue_result);
     }
     fn ensure_bridge_subscription(&mut self) {
         if self.bridge_events.is_none() {
@@ -1638,6 +1705,103 @@ mod tests {
             .resolve_shock(),
             None
         );
+    }
+    #[test]
+    fn shock_queue_accepts_capacity_without_blocking() {
+        let (sender, receiver) = mpsc::sync_channel(SHOCK_QUEUE_CAPACITY);
+        for value in 0..SHOCK_QUEUE_CAPACITY {
+            assert!(sender.try_send(value).is_ok());
+        }
+        assert!(matches!(
+            sender.try_send(SHOCK_QUEUE_CAPACITY),
+            Err(TrySendError::Full(_))
+        ));
+        drop(receiver);
+        assert!(matches!(
+            sender.try_send(0),
+            Err(TrySendError::Disconnected(_))
+        ));
+    }
+    #[test]
+    fn expired_shock_jobs_are_skipped_before_dispatch() {
+        let queued_at = Instant::now();
+        let now = queued_at + MAX_SHOCK_QUEUE_AGE;
+        assert!(shock_job_expired_at(queued_at, now));
+        assert!(!shock_job_expired_at(
+            queued_at,
+            now - Duration::from_millis(1)
+        ));
+    }
+    #[test]
+    fn expired_completion_is_skipped_and_decrements_in_flight() {
+        let request = ShockRequest {
+            provider: ProviderKind::PiShock,
+            target: None,
+            resolved: None,
+
+            death: DeathIdentity {
+                session_id: "session".to_owned(),
+                sequence: 1,
+                client_time_ms: 1,
+                detection: "test".to_owned(),
+            },
+        };
+        let (sender, receiver) = mpsc::channel();
+        let mut state = AppState {
+            shock_result: receiver,
+            shock_in_flight: 1,
+            ..AppState::default()
+        };
+        sender
+            .send(ShockCompletion {
+                request,
+                result: ShockCompletionResult::Skipped { reason: "expired" },
+            })
+            .unwrap();
+        state.poll_shock();
+        assert_eq!(state.shock_in_flight, 0);
+        let Some(ShockStatus::Skipped { reason, .. }) = state.shock_status else {
+            panic!("expected skipped status");
+        };
+        assert_eq!(reason, "expired");
+    }
+    #[test]
+    fn queue_submission_outcomes_update_status_and_in_flight_count() {
+        let request = ShockRequest {
+            provider: ProviderKind::PiShock,
+            target: None,
+            resolved: None,
+            death: DeathIdentity {
+                session_id: "session".to_owned(),
+                sequence: 1,
+                client_time_ms: 1,
+                detection: "test".to_owned(),
+            },
+        };
+
+        let mut full = AppState::default();
+        full.apply_shock_enqueue_result(request.clone(), ShockEnqueueResult::Full);
+        assert_eq!(full.shock_in_flight, 0);
+        assert!(matches!(
+            full.shock_status,
+            Some(ShockStatus::Skipped { reason, .. }) if reason == "shock queue is full"
+        ));
+
+        let mut disconnected = AppState::default();
+        disconnected.apply_shock_enqueue_result(request.clone(), ShockEnqueueResult::Disconnected);
+        assert_eq!(disconnected.shock_in_flight, 0);
+        assert!(matches!(
+            disconnected.shock_status,
+            Some(ShockStatus::Failed { error, .. }) if error == "shock worker is unavailable"
+        ));
+
+        let mut accepted = AppState::default();
+        accepted.apply_shock_enqueue_result(request, ShockEnqueueResult::Accepted);
+        assert_eq!(accepted.shock_in_flight, 1);
+        assert!(matches!(
+            accepted.shock_status,
+            Some(ShockStatus::Sending(_))
+        ));
     }
     #[test]
     fn death_deduplication_accepts_new_sessions_without_hook_ready() {

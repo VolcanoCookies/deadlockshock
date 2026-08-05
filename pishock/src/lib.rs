@@ -42,6 +42,7 @@ pub use websocket::WebSocketClient;
 
 pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+pub(crate) const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_DURATION: u8 = 15;
 
 /// A PiShock username and API key.
@@ -57,8 +58,8 @@ impl Credentials {
     /// Creates credentials. Values are validated when constructing either client.
     pub fn new(username: impl Into<String>, api_key: impl Into<String>) -> Self {
         Self {
-            username: username.into(),
-            api_key: api_key.into(),
+            username: username.into().trim().to_owned(),
+            api_key: api_key.into().trim().to_owned(),
         }
     }
 }
