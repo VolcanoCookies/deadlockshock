@@ -5,6 +5,10 @@
 DeadlockShock is a small UI mod and companion app that can sync local-player deaths, ability uses, and cooldown readiness to external shockers.
 Made because my friend complained about OCR missfiring for them.
 
+## !!! Required Deadlock mod !!!
+
+The companion app does not work by itself. Install and enable the [DeadlockShock mod from GameBanana](https://gamebanana.com/mods/700758) in Deadlock before starting the companion. The mod detects gameplay events and writes them to the log that the companion listens to.
+
 ## Contents
 
 - `mod/` has the Panorama gameplay-state hook.
