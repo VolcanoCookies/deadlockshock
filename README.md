@@ -2,12 +2,12 @@
 
 # DeadlockShock
 
-DeadlockShock is a small ui mod + companion app, to better sync in-game deaths to external shockers.
+DeadlockShock is a small UI mod and companion app that can sync local-player deaths, ability uses, and cooldown readiness to external shockers.
 Made because my friend complained about OCR missfiring for them.
 
 ## Contents
 
-- `mod/` has the Panorama death hook.
+- `mod/` has the Panorama gameplay-state hook.
 - `companion/` is the desktop app.
 - `pishock/` and `openshock/` talk to the two shock providers.
 
@@ -32,7 +32,7 @@ That puts the addon at `dist/deadlock_death_hook.vpk`. Install and enable it in 
 cargo run --manifest-path companion/Cargo.toml --release
 ```
 
-Pick PiShock or OpenShock, enter your credentials, choose a device group, and try the test sound. Set the intensity and duration you want, then auto-detect `console.log` and start the listener. From there, every new local-player death shocks the available shockers in that group.
+Pick PiShock or OpenShock, enter your credentials, choose a device group, and try the test sound. Choose which triggers to enable, set the intensity and duration you want, then auto-detect `console.log` and start the listener. Local-player death remains enabled by default; ability-use and cooldown-ready triggers are opt-in.
 
 The companion remembers your setup—including credentials—in your OS user config directory.
 

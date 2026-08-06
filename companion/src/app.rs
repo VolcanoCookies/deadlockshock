@@ -6,7 +6,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::bridge_listener::{
-    BridgeEvent, ConsoleLogListener, ListenerPhase, ListenerStatus, LocalPlayerDeath,
+    AbilityTrigger, BridgeEvent, ConsoleLogListener, ListenerPhase, ListenerStatus,
+    LocalPlayerDeath,
 };
 use crate::deadlock_path::{self, Detection, DetectionError};
 use crate::persistence::{PersistedState, Persistence, default_state_path};
@@ -127,12 +128,87 @@ pub struct ResolvedShock {
     pub duration_ms: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TriggerKind {
+    Death,
+    AbilityUse,
+    AbilityCooldownReady,
+}
+
+impl TriggerKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Death => "death",
+            Self::AbilityUse => "ability use",
+            Self::AbilityCooldownReady => "ability cooldown ready",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct DeathIdentity {
+struct TriggerIdentity {
+    kind: TriggerKind,
     session_id: String,
     sequence: u64,
     client_time_ms: u64,
     detection: String,
+    ability_slot: Option<u32>,
+    ability_name: Option<String>,
+    charges_before: Option<u64>,
+    charges_after: Option<u64>,
+}
+
+impl TriggerIdentity {
+    fn from_death(death: LocalPlayerDeath) -> Self {
+        Self {
+            kind: TriggerKind::Death,
+            session_id: death.session_id,
+            sequence: death.sequence,
+            client_time_ms: death.client_time_ms,
+            detection: death.detection,
+            ability_slot: None,
+            ability_name: None,
+            charges_before: None,
+            charges_after: None,
+        }
+    }
+
+    fn from_ability(kind: TriggerKind, ability: AbilityTrigger) -> Self {
+        Self {
+            kind,
+            session_id: ability.session_id,
+            sequence: ability.sequence,
+            client_time_ms: ability.client_time_ms,
+            detection: ability.detection,
+            ability_slot: Some(ability.ability_slot),
+            ability_name: ability.ability_name,
+            charges_before: ability.charges_before,
+            charges_after: ability.charges_after,
+        }
+    }
+
+    fn status_description(&self) -> String {
+        if self.kind == TriggerKind::Death {
+            return format!("death {}#{}", self.session_id, self.sequence);
+        }
+        let name = self
+            .ability_name
+            .as_deref()
+            .map(|name| format!(" ({name})"))
+            .unwrap_or_default();
+        let charges = match (self.charges_before, self.charges_after) {
+            (Some(before), Some(after)) => format!(", charges {before}→{after}"),
+            _ => String::new(),
+        };
+        format!(
+            "{} slot {}{name}, detection {}{charges}, {}#{}",
+            self.kind.label(),
+            self.ability_slot.unwrap_or_default(),
+            self.detection,
+            self.session_id,
+            self.sequence
+        )
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -140,7 +216,7 @@ struct ShockRequest {
     provider: ProviderKind,
     target: Option<ProviderTarget>,
     resolved: Option<ResolvedShock>,
-    death: DeathIdentity,
+    trigger: TriggerIdentity,
 }
 
 struct ShockJob {
@@ -209,22 +285,22 @@ impl ShockStatus {
                 )
             })
             .unwrap_or_else(|| "settings unavailable".to_owned());
-        let death = format!("{}#{}", request.death.session_id, request.death.sequence);
+        let trigger = request.trigger.status_description();
         match self {
             Self::Sending(_) => format!(
-                "{}: Sending shock to {target} at {resolved} (death {death})…",
+                "{}: Sending shock to {target} at {resolved} ({trigger})…",
                 request.provider.label()
             ),
             Self::Sent(_) => format!(
-                "{}: Shock sent to {target} at {resolved} (death {death}).",
+                "{}: Shock sent to {target} at {resolved} ({trigger}).",
                 request.provider.label()
             ),
             Self::Failed { error, .. } => format!(
-                "{}: Shock failed for {target} at {resolved} (death {death}): {error}",
+                "{}: Shock failed for {target} at {resolved} ({trigger}): {error}",
                 request.provider.label()
             ),
             Self::Skipped { reason, .. } => format!(
-                "{}: Shock skipped for {target} at {resolved} (death {death}): {reason}",
+                "{}: Shock skipped for {target} at {resolved} ({trigger}): {reason}",
                 request.provider.label()
             ),
         }
@@ -283,6 +359,9 @@ pub struct AppState {
     pub max_duration: f32,
     pub duration: f32,
     pub log_path: String,
+    pub death_trigger_enabled: bool,
+    pub ability_use_trigger_enabled: bool,
+    pub ability_cooldown_ready_trigger_enabled: bool,
     client: Option<Arc<ConnectedProvider>>,
     connection_error: Option<String>,
     connection_result: Option<Receiver<ConnectionResult>>,
@@ -296,7 +375,7 @@ pub struct AppState {
     bridge_listener: ConsoleLogListener,
     bridge_events: Option<Receiver<BridgeEvent>>,
     last_bridge_event: Option<BridgeEvent>,
-    last_death: Option<(String, u64)>,
+    last_sequence: Option<(String, u64)>,
     listener_action_error: Option<String>,
 }
 
@@ -320,6 +399,9 @@ impl Default for AppState {
             max_duration: MIN_SHOCK_DURATION,
             duration: MIN_SHOCK_DURATION,
             log_path: String::new(),
+            death_trigger_enabled: true,
+            ability_use_trigger_enabled: false,
+            ability_cooldown_ready_trigger_enabled: false,
             client: None,
             connection_error: None,
             connection_result: None,
@@ -333,7 +415,7 @@ impl Default for AppState {
             bridge_listener: ConsoleLogListener::default(),
             bridge_events: None,
             last_bridge_event: None,
-            last_death: None,
+            last_sequence: None,
             listener_action_error: None,
         }
     }
@@ -392,11 +474,14 @@ impl AppState {
         self.max_duration = MIN_SHOCK_DURATION;
         self.duration = MIN_SHOCK_DURATION;
         self.log_path.clear();
+        self.death_trigger_enabled = true;
+        self.ability_use_trigger_enabled = false;
+        self.ability_cooldown_ready_trigger_enabled = false;
         self.log_detection_status = None;
         self.bridge_listener = ConsoleLogListener::default();
         self.bridge_events = None;
         self.last_bridge_event = None;
-        self.last_death = None;
+        self.last_sequence = None;
         self.listener_action_error = None;
         self.shock_status = None;
         self.shock_in_flight = 0;
@@ -411,10 +496,10 @@ impl AppState {
         self.bridge_listener.status().phase != ListenerPhase::Stopped
     }
     #[cfg(test)]
-    pub(crate) fn runtime_death_and_shock_state_is_clear(&self) -> bool {
+    pub(crate) fn runtime_trigger_and_shock_state_is_clear(&self) -> bool {
         self.bridge_events.is_none()
             && self.last_bridge_event.is_none()
-            && self.last_death.is_none()
+            && self.last_sequence.is_none()
             && self.shock_status.is_none()
             && self.shock_in_flight == 0
     }
@@ -675,17 +760,19 @@ impl AppState {
             match self.shock_result.try_recv() {
                 Ok(completion) => {
                     self.shock_in_flight = self.shock_in_flight.saturating_sub(1);
+                    let trigger = &completion.request.trigger;
                     match completion.result {
                         ShockCompletionResult::Skipped { reason } => {
                             log::warn!(
                                 target: "companion::app",
-                                "shock_skipped provider={} target={:?} intensity={:?} duration_ms={:?} session_id={:?} sequence={} reason={}",
+                                "shock_skipped trigger={} provider={} target={:?} intensity={:?} duration_ms={:?} session_id={:?} sequence={} reason={}",
+                                trigger.kind.label(),
                                 completion.request.provider.label(),
                                 completion.request.target.as_ref().map(ProviderTarget::id),
                                 completion.request.resolved.map(|resolved| resolved.intensity),
                                 completion.request.resolved.map(|resolved| resolved.duration_ms),
-                                completion.request.death.session_id,
-                                completion.request.death.sequence,
+                                trigger.session_id,
+                                trigger.sequence,
                                 reason
                             );
                             self.shock_status = Some(ShockStatus::Skipped {
@@ -696,26 +783,28 @@ impl AppState {
                         ShockCompletionResult::Completed(Ok(())) => {
                             log::info!(
                                 target: "companion::app",
-                                "shock_sent provider={} target={:?} intensity={:?} duration_ms={:?} session_id={:?} sequence={}",
+                                "shock_sent trigger={} provider={} target={:?} intensity={:?} duration_ms={:?} session_id={:?} sequence={}",
+                                trigger.kind.label(),
                                 completion.request.provider.label(),
                                 completion.request.target.as_ref().map(ProviderTarget::id),
                                 completion.request.resolved.map(|resolved| resolved.intensity),
                                 completion.request.resolved.map(|resolved| resolved.duration_ms),
-                                completion.request.death.session_id,
-                                completion.request.death.sequence
+                                trigger.session_id,
+                                trigger.sequence
                             );
                             self.shock_status = Some(ShockStatus::Sent(completion.request));
                         }
                         ShockCompletionResult::Completed(Err(error)) => {
                             log::warn!(
                                 target: "companion::app",
-                                "shock_failed provider={} target={:?} intensity={:?} duration_ms={:?} session_id={:?} sequence={} error_kind={}",
+                                "shock_failed trigger={} provider={} target={:?} intensity={:?} duration_ms={:?} session_id={:?} sequence={} error_kind={}",
+                                trigger.kind.label(),
                                 completion.request.provider.label(),
                                 completion.request.target.as_ref().map(ProviderTarget::id),
                                 completion.request.resolved.map(|resolved| resolved.intensity),
                                 completion.request.resolved.map(|resolved| resolved.duration_ms),
-                                completion.request.death.session_id,
-                                completion.request.death.sequence,
+                                trigger.session_id,
+                                trigger.sequence,
                                 provider_error_kind(&error)
                             );
                             self.shock_status = Some(ShockStatus::Failed {
@@ -739,49 +828,61 @@ impl AppState {
         }
     }
 
-    fn death_is_new(&mut self, death: &LocalPlayerDeath) -> bool {
-        if let Some((session_id, sequence)) = &self.last_death
-            && session_id == &death.session_id
-            && death.sequence <= *sequence
+    fn trigger_is_new(&mut self, trigger: &TriggerIdentity) -> bool {
+        if let Some((session_id, sequence)) = &self.last_sequence
+            && session_id == &trigger.session_id
+            && trigger.sequence <= *sequence
         {
             log::debug!(
                 target: "companion::app",
-                "shock_skipped reason=duplicate_or_out_of_order session_id={:?} sequence={}",
-                death.session_id,
-                death.sequence
+                "shock_skipped reason=duplicate_or_out_of_order trigger={} session_id={:?} sequence={}",
+                trigger.kind.label(),
+                trigger.session_id,
+                trigger.sequence
             );
             return false;
         }
-        self.last_death = Some((death.session_id.clone(), death.sequence));
+        self.last_sequence = Some((trigger.session_id.clone(), trigger.sequence));
         true
     }
 
+    fn trigger_enabled(&self, kind: TriggerKind) -> bool {
+        match kind {
+            TriggerKind::Death => self.death_trigger_enabled,
+            TriggerKind::AbilityUse => self.ability_use_trigger_enabled,
+            TriggerKind::AbilityCooldownReady => self.ability_cooldown_ready_trigger_enabled,
+        }
+    }
+
     fn apply_shock_enqueue_result(&mut self, request: ShockRequest, result: ShockEnqueueResult) {
+        let trigger = &request.trigger;
         match result {
             ShockEnqueueResult::Accepted => {
                 self.shock_status = Some(ShockStatus::Sending(request.clone()));
                 self.shock_in_flight = self.shock_in_flight.saturating_add(1);
                 log::info!(
                     target: "companion::app",
-                    "shock_queued provider={} target={:?} intensity={:?} duration_ms={:?} session_id={:?} sequence={}",
+                    "shock_queued trigger={} provider={} target={:?} intensity={:?} duration_ms={:?} session_id={:?} sequence={}",
+                    trigger.kind.label(),
                     request.provider.label(),
                     request.target.as_ref().map(ProviderTarget::id),
                     request.resolved.map(|resolved| resolved.intensity),
                     request.resolved.map(|resolved| resolved.duration_ms),
-                    request.death.session_id,
-                    request.death.sequence
+                    trigger.session_id,
+                    trigger.sequence
                 );
             }
             ShockEnqueueResult::Full => {
                 log::warn!(
                     target: "companion::app",
-                    "shock_skipped provider={} target={:?} intensity={:?} duration_ms={:?} session_id={:?} sequence={} reason=queue_capacity",
+                    "shock_skipped trigger={} provider={} target={:?} intensity={:?} duration_ms={:?} session_id={:?} sequence={} reason=queue_capacity",
+                    trigger.kind.label(),
                     request.provider.label(),
                     request.target.as_ref().map(ProviderTarget::id),
                     request.resolved.map(|resolved| resolved.intensity),
                     request.resolved.map(|resolved| resolved.duration_ms),
-                    request.death.session_id,
-                    request.death.sequence
+                    trigger.session_id,
+                    trigger.sequence
                 );
                 self.shock_status = Some(ShockStatus::Skipped {
                     request,
@@ -791,13 +892,14 @@ impl AppState {
             ShockEnqueueResult::Disconnected => {
                 log::error!(
                     target: "companion::app",
-                    "shock_failed provider={} target={:?} intensity={:?} duration_ms={:?} session_id={:?} sequence={} reason=worker_unavailable",
+                    "shock_failed trigger={} provider={} target={:?} intensity={:?} duration_ms={:?} session_id={:?} sequence={} reason=worker_unavailable",
+                    trigger.kind.label(),
                     request.provider.label(),
                     request.target.as_ref().map(ProviderTarget::id),
                     request.resolved.map(|resolved| resolved.intensity),
                     request.resolved.map(|resolved| resolved.duration_ms),
-                    request.death.session_id,
-                    request.death.sequence
+                    trigger.session_id,
+                    trigger.sequence
                 );
                 self.shock_status = Some(ShockStatus::Failed {
                     request,
@@ -807,31 +909,39 @@ impl AppState {
         }
     }
 
-    fn queue_death_shock(&mut self, death: LocalPlayerDeath) {
-        if !self.death_is_new(&death) {
+    fn queue_trigger_shock(&mut self, trigger: TriggerIdentity) {
+        if !self.trigger_is_new(&trigger) {
+            return;
+        }
+        if !self.trigger_enabled(trigger.kind) {
+            log::info!(
+                target: "companion::app",
+                "trigger_disabled trigger={} session_id={:?} sequence={} ability_slot={:?} detection={:?}",
+                trigger.kind.label(),
+                trigger.session_id,
+                trigger.sequence,
+                trigger.ability_slot,
+                trigger.detection
+            );
             return;
         }
         let request = ShockRequest {
             provider: self.provider,
             target: self.selected_device().cloned(),
             resolved: self.resolve_shock(),
-            death: DeathIdentity {
-                session_id: death.session_id,
-                sequence: death.sequence,
-                client_time_ms: death.client_time_ms,
-                detection: death.detection,
-            },
+            trigger,
         };
         let Some(client) = self.client.clone() else {
             log::warn!(
                 target: "companion::app",
-                "shock_skipped provider={} target={:?} intensity={:?} duration_ms={:?} session_id={:?} sequence={} reason=provider_not_connected",
+                "shock_skipped trigger={} provider={} target={:?} intensity={:?} duration_ms={:?} session_id={:?} sequence={} reason=provider_not_connected",
+                request.trigger.kind.label(),
                 request.provider.label(),
                 request.target.as_ref().map(ProviderTarget::id),
                 request.resolved.map(|resolved| resolved.intensity),
                 request.resolved.map(|resolved| resolved.duration_ms),
-                request.death.session_id,
-                request.death.sequence
+                request.trigger.session_id,
+                request.trigger.sequence
             );
             self.shock_status = Some(ShockStatus::Skipped {
                 request,
@@ -842,12 +952,13 @@ impl AppState {
         if request.target.is_none() {
             log::warn!(
                 target: "companion::app",
-                "shock_skipped provider={} target=none intensity={:?} duration_ms={:?} session_id={:?} sequence={} reason=no_target",
+                "shock_skipped trigger={} provider={} target=none intensity={:?} duration_ms={:?} session_id={:?} sequence={} reason=no_target",
+                request.trigger.kind.label(),
                 request.provider.label(),
                 request.resolved.map(|resolved| resolved.intensity),
                 request.resolved.map(|resolved| resolved.duration_ms),
-                request.death.session_id,
-                request.death.sequence
+                request.trigger.session_id,
+                request.trigger.sequence
             );
             self.shock_status = Some(ShockStatus::Skipped {
                 request,
@@ -858,11 +969,12 @@ impl AppState {
         if request.resolved.is_none() {
             log::warn!(
                 target: "companion::app",
-                "shock_skipped provider={} target={:?} intensity=none duration_ms=none session_id={:?} sequence={} reason=invalid_settings",
+                "shock_skipped trigger={} provider={} target={:?} intensity=none duration_ms=none session_id={:?} sequence={} reason=invalid_settings",
+                request.trigger.kind.label(),
                 request.provider.label(),
                 request.target.as_ref().map(ProviderTarget::id),
-                request.death.session_id,
-                request.death.sequence
+                request.trigger.session_id,
+                request.trigger.sequence
             );
             self.shock_status = Some(ShockStatus::Skipped {
                 request,
@@ -906,16 +1018,54 @@ impl AppState {
                         ),
                         BridgeEvent::LocalPlayerDeath(death) => log::info!(
                             target: "companion::app",
-                            "bridge_death_received session_id={:?} sequence={} client_time_ms={} detection={:?}",
+                            "bridge_trigger_received trigger=death session_id={:?} sequence={} client_time_ms={} detection={:?}",
                             death.session_id,
                             death.sequence,
                             death.client_time_ms,
                             death.detection
                         ),
+                        BridgeEvent::AbilityUsed(ability) => log::info!(
+                            target: "companion::app",
+                            "bridge_trigger_received trigger=ability_use session_id={:?} sequence={} client_time_ms={} ability_slot={} detection={:?} charges_before={:?} charges_after={:?}",
+                            ability.session_id,
+                            ability.sequence,
+                            ability.client_time_ms,
+                            ability.ability_slot,
+                            ability.detection,
+                            ability.charges_before,
+                            ability.charges_after
+                        ),
+                        BridgeEvent::AbilityCooldownReady(ability) => log::info!(
+                            target: "companion::app",
+                            "bridge_trigger_received trigger=ability_cooldown_ready session_id={:?} sequence={} client_time_ms={} ability_slot={} detection={:?} charges_before={:?} charges_after={:?}",
+                            ability.session_id,
+                            ability.sequence,
+                            ability.client_time_ms,
+                            ability.ability_slot,
+                            ability.detection,
+                            ability.charges_before,
+                            ability.charges_after
+                        ),
                     }
                     self.last_bridge_event = Some(event.clone());
-                    if let BridgeEvent::LocalPlayerDeath(death) = event {
-                        self.queue_death_shock(death);
+                    let trigger = match event {
+                        BridgeEvent::HookReady(_) => None,
+                        BridgeEvent::LocalPlayerDeath(death) => {
+                            Some(TriggerIdentity::from_death(death))
+                        }
+                        BridgeEvent::AbilityUsed(ability) => Some(TriggerIdentity::from_ability(
+                            TriggerKind::AbilityUse,
+                            ability,
+                        )),
+                        BridgeEvent::AbilityCooldownReady(ability) => {
+                            Some(TriggerIdentity::from_ability(
+                                TriggerKind::AbilityCooldownReady,
+                                ability,
+                            ))
+                        }
+                    };
+                    if let Some(trigger) = trigger {
+                        self.queue_trigger_shock(trigger);
                     }
                 }
                 Err(TryRecvError::Empty) => break,
@@ -1142,6 +1292,19 @@ impl AppState {
             let label = status.label();
             status_line(ui, &label, status.color());
         }
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(8.0);
+        ui.heading("Triggers");
+        ui.checkbox(&mut self.death_trigger_enabled, "Local-player death");
+        ui.checkbox(&mut self.ability_use_trigger_enabled, "Ability used");
+        ui.checkbox(
+            &mut self.ability_cooldown_ready_trigger_enabled,
+            "Ability cooldown ready",
+        );
+        ui.label(
+            "Ability triggers are opt-in. Every enabled trigger uses the shock settings below.",
+        );
         ui.add_space(8.0);
         ui.separator();
         ui.add_space(8.0);
@@ -1372,7 +1535,7 @@ impl CompanionApp {
             .open(&mut open)
             .show(ui.ctx(), |ui| {
                 ui.label(
-                    "This clears saved credentials, target preference, shock settings, and log path.",
+                    "This clears saved credentials, target preference, trigger and shock settings, and log path.",
                 );
                 ui.label("Any active log listener will be stopped.");
                 if !reset_available {
@@ -1463,12 +1626,38 @@ fn draw_listener_status(ui: &mut Ui, status: &ListenerStatus, last_event: Option
     let event = match (last_event, status.last_event_at) {
         (Some(event), Some(at)) => format!(
             "Last bridge event: {} ({} ago).",
-            event.event_name(),
+            bridge_event_description(event),
             format_duration(at.elapsed())
         ),
         _ => "Last bridge event: none since listener start.".to_owned(),
     };
     ui.label(event);
+}
+fn bridge_event_description(event: &BridgeEvent) -> String {
+    let ability_description = |name: &str, ability: &AbilityTrigger| {
+        let ability_name = ability
+            .ability_name
+            .as_deref()
+            .map(|name| format!(" ({name})"))
+            .unwrap_or_default();
+        let charges = match (ability.charges_before, ability.charges_after) {
+            (Some(before), Some(after)) => format!(", charges {before}→{after}"),
+            _ => String::new(),
+        };
+        format!(
+            "{name}, slot {}{ability_name}, detection {}{charges}",
+            ability.ability_slot, ability.detection
+        )
+    };
+    match event {
+        BridgeEvent::HookReady(_) | BridgeEvent::LocalPlayerDeath(_) => {
+            event.event_name().to_owned()
+        }
+        BridgeEvent::AbilityUsed(ability) => ability_description("ability_used", ability),
+        BridgeEvent::AbilityCooldownReady(ability) => {
+            ability_description("ability_cooldown_ready", ability)
+        }
+    }
 }
 fn format_duration(duration: Duration) -> String {
     if duration.as_secs() >= 60 {
@@ -1655,7 +1844,21 @@ mod tests {
                 .contains("-condebug")
         );
     }
-    fn death(session_id: &str, sequence: u64) -> LocalPlayerDeath {
+    fn trigger(kind: TriggerKind, session_id: &str, sequence: u64) -> TriggerIdentity {
+        TriggerIdentity {
+            kind,
+            session_id: session_id.to_owned(),
+            client_time_ms: sequence,
+            sequence,
+            detection: "test".to_owned(),
+            ability_slot: (kind != TriggerKind::Death).then_some(2),
+            ability_name: (kind != TriggerKind::Death).then(|| "Test Ability".to_owned()),
+            charges_before: None,
+            charges_after: None,
+        }
+    }
+
+    fn death_event(session_id: &str, sequence: u64) -> LocalPlayerDeath {
         LocalPlayerDeath {
             schema: 1,
             session_id: session_id.to_owned(),
@@ -1738,13 +1941,7 @@ mod tests {
             provider: ProviderKind::PiShock,
             target: None,
             resolved: None,
-
-            death: DeathIdentity {
-                session_id: "session".to_owned(),
-                sequence: 1,
-                client_time_ms: 1,
-                detection: "test".to_owned(),
-            },
+            trigger: trigger(TriggerKind::Death, "session", 1),
         };
         let (sender, receiver) = mpsc::channel();
         let mut state = AppState {
@@ -1765,18 +1962,14 @@ mod tests {
         };
         assert_eq!(reason, "expired");
     }
+
     #[test]
     fn queue_submission_outcomes_update_status_and_in_flight_count() {
         let request = ShockRequest {
             provider: ProviderKind::PiShock,
             target: None,
             resolved: None,
-            death: DeathIdentity {
-                session_id: "session".to_owned(),
-                sequence: 1,
-                client_time_ms: 1,
-                detection: "test".to_owned(),
-            },
+            trigger: trigger(TriggerKind::Death, "session", 1),
         };
 
         let mut full = AppState::default();
@@ -1803,20 +1996,51 @@ mod tests {
             Some(ShockStatus::Sending(_))
         ));
     }
+
     #[test]
-    fn death_deduplication_accepts_new_sessions_without_hook_ready() {
+    fn actionable_events_share_a_global_sequence_watermark_across_trigger_kinds() {
         let mut state = AppState::default();
-        state.queue_death_shock(death("first", 4));
+        state.queue_trigger_shock(trigger(TriggerKind::AbilityUse, "first", 4));
+        assert_eq!(state.last_sequence, Some(("first".to_owned(), 4)));
+        assert!(state.shock_status.is_none());
+
+        state.queue_trigger_shock(trigger(TriggerKind::Death, "first", 3));
+        assert!(state.shock_status.is_none());
+        state.queue_trigger_shock(trigger(TriggerKind::Death, "first", 5));
         let first = state.shock_status.clone();
-        state.queue_death_shock(death("first", 4));
+        assert!(matches!(&first, Some(ShockStatus::Skipped { .. })));
+
+        state.ability_use_trigger_enabled = true;
+        state.queue_trigger_shock(trigger(TriggerKind::AbilityUse, "first", 5));
         assert_eq!(state.shock_status, first);
-        state.queue_death_shock(death("first", 3));
-        assert_eq!(state.shock_status, first);
-        state.queue_death_shock(death("second", 1));
+        state.queue_trigger_shock(trigger(TriggerKind::AbilityUse, "first", 6));
         assert_ne!(state.shock_status, first);
+
+        state.queue_trigger_shock(trigger(TriggerKind::Death, "second", 1));
+        assert_eq!(state.last_sequence, Some(("second".to_owned(), 1)));
     }
+
     #[test]
-    fn hook_ready_is_observed_but_never_triggers_a_shock() {
+    fn trigger_defaults_and_cooldown_enablement_control_queueing() {
+        let mut state = AppState::default();
+        assert!(state.death_trigger_enabled);
+        assert!(!state.ability_use_trigger_enabled);
+        assert!(!state.ability_cooldown_ready_trigger_enabled);
+
+        state.queue_trigger_shock(trigger(TriggerKind::AbilityCooldownReady, "session", 1));
+        assert_eq!(state.last_sequence, Some(("session".to_owned(), 1)));
+        assert!(state.shock_status.is_none());
+
+        state.ability_cooldown_ready_trigger_enabled = true;
+        state.queue_trigger_shock(trigger(TriggerKind::AbilityCooldownReady, "session", 2));
+        assert!(matches!(
+            state.shock_status,
+            Some(ShockStatus::Skipped { .. })
+        ));
+    }
+
+    #[test]
+    fn hook_ready_is_observed_but_never_advances_the_actionable_watermark() {
         let (sender, receiver) = mpsc::channel();
         let mut state = AppState {
             bridge_events: Some(receiver),
@@ -1831,21 +2055,58 @@ mod tests {
             }))
             .unwrap();
         state.poll_bridge_events();
-        assert!(state.last_death.is_none());
+        assert!(state.last_sequence.is_none());
         assert!(state.shock_status.is_none());
     }
+
     #[test]
-    fn missing_prerequisites_are_recorded_as_skipped() {
-        let mut state = AppState::default();
-        state.queue_death_shock(death("session", 1));
+    fn enabled_death_preserves_skipped_status_when_prerequisites_are_missing() {
+        let (sender, receiver) = mpsc::channel();
+        let mut state = AppState {
+            bridge_events: Some(receiver),
+            ..AppState::default()
+        };
+        sender
+            .send(BridgeEvent::LocalPlayerDeath(death_event("session", 1)))
+            .unwrap();
+        state.poll_bridge_events();
         assert!(matches!(
             state.shock_status,
             Some(ShockStatus::Skipped { .. })
         ));
         assert_eq!(state.shock_in_flight, 0);
     }
+
     #[test]
-    fn shock_status_contains_provider_target_values_and_death_identity() {
+    fn parsed_enabled_ability_event_reaches_the_shock_queue_path() {
+        let event = crate::bridge_listener::parse_bridge_record(
+            "[DEADLOCK_DEATH_HOOK]{\"schema\":1,\"event\":\"ability_cooldown_ready\",\"session_id\":\"session\",\"client_time_ms\":7,\"sequence\":3,\"ability_slot\":2,\"ability_name\":\"Bookwyrm\",\"detection\":\"charge_restored\",\"charges_before\":1,\"charges_after\":2}",
+        )
+        .expect("valid ability event");
+        let (sender, receiver) = mpsc::channel();
+        let mut state = AppState {
+            ability_cooldown_ready_trigger_enabled: true,
+            bridge_events: Some(receiver),
+            ..AppState::default()
+        };
+
+        sender.send(event).unwrap();
+        state.poll_bridge_events();
+
+        assert_eq!(state.last_sequence, Some(("session".to_owned(), 3)));
+        assert!(matches!(
+            state.shock_status,
+            Some(ShockStatus::Skipped { .. })
+        ));
+        assert_eq!(state.shock_in_flight, 0);
+    }
+
+    #[test]
+    fn shock_status_contains_generic_trigger_slot_and_detection_details() {
+        let mut ability = trigger(TriggerKind::AbilityCooldownReady, "session", 9);
+        ability.detection = "charge_restored".to_owned();
+        ability.charges_before = Some(1);
+        ability.charges_after = Some(2);
         let request = ShockRequest {
             provider: ProviderKind::OpenShock,
             target: Some(ProviderTarget::new(
@@ -1856,18 +2117,16 @@ mod tests {
                 intensity: 20,
                 duration_ms: 500,
             }),
-            death: DeathIdentity {
-                session_id: "session".to_owned(),
-                sequence: 9,
-                client_time_ms: 42,
-                detection: "test".to_owned(),
-            },
+            trigger: ability,
         };
         let status = ShockStatus::Sent(request);
         let label = status.label();
         assert!(label.contains("OpenShock"));
         assert!(label.contains("group"));
         assert!(label.contains("20% for 0.5 s"));
+        assert!(label.contains("ability cooldown ready slot 2"));
+        assert!(label.contains("charge_restored"));
+        assert!(label.contains("charges 1→2"));
         assert!(label.contains("session#9"));
     }
     #[test]
@@ -1913,12 +2172,15 @@ mod tests {
         app.state.preferred_target = Some(TargetId::OpenShock("group".to_owned()));
         app.state.shock_mode = ShockMode::Fixed;
         app.state.intensity = 80.0;
+        app.state.ability_use_trigger_enabled = true;
+        app.state.ability_cooldown_ready_trigger_enabled = true;
         let log_path = directory.path().join("console.log");
         app.state.log_path = log_path.display().to_string();
         app.state.start_log_listener(log_path).unwrap();
-        app.state.queue_death_shock(death("session", 1));
+        app.state
+            .queue_trigger_shock(trigger(TriggerKind::Death, "session", 1));
         assert!(app.state.listener_is_running());
-        assert!(!app.state.runtime_death_and_shock_state_is_clear());
+        assert!(!app.state.runtime_trigger_and_shock_state_is_clear());
 
         assert!(app.reset_and_save());
         assert_eq!(
@@ -1926,7 +2188,7 @@ mod tests {
             PersistedState::default()
         );
         assert!(!app.state.listener_is_running());
-        assert!(app.state.runtime_death_and_shock_state_is_clear());
+        assert!(app.state.runtime_trigger_and_shock_state_is_clear());
         assert_eq!(app.state.credential_state, CredentialState::Unknown);
         assert!(app.state.devices.is_empty());
         assert!(app.state.selected_device.is_none());

@@ -13,7 +13,7 @@ use crate::app::{
 };
 use crate::provider::{ProviderKind, TargetId};
 
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 pub const SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -24,7 +24,41 @@ pub(crate) struct PersistedState {
     credentials: PersistedCredentials,
     preferred_target: Option<PersistedTarget>,
     shock: PersistedShock,
+    triggers: PersistedTriggers,
     log_path: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedStateV1 {
+    schema_version: u32,
+    provider: PersistedProvider,
+    credentials: PersistedCredentials,
+    preferred_target: Option<PersistedTarget>,
+    shock: PersistedShock,
+    log_path: String,
+}
+
+#[derive(Deserialize)]
+struct SchemaVersion {
+    schema_version: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedTriggers {
+    local_player_death: bool,
+    ability_used: bool,
+    ability_cooldown_ready: bool,
+}
+
+impl Default for PersistedTriggers {
+    fn default() -> Self {
+        Self {
+            local_player_death: true,
+            ability_used: false,
+            ability_cooldown_ready: false,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -107,6 +141,7 @@ impl Default for PersistedState {
                 },
             },
             preferred_target: None,
+            triggers: PersistedTriggers::default(),
             shock: PersistedShock {
                 mode: PersistedShockMode::Interval,
                 interval: PersistedShockInterval {
@@ -121,6 +156,20 @@ impl Default for PersistedState {
                 },
             },
             log_path: String::new(),
+        }
+    }
+}
+impl From<PersistedStateV1> for PersistedState {
+    fn from(state: PersistedStateV1) -> Self {
+        debug_assert_eq!(state.schema_version, 1);
+        Self {
+            schema_version: SCHEMA_VERSION,
+            provider: state.provider,
+            credentials: state.credentials,
+            preferred_target: state.preferred_target,
+            triggers: PersistedTriggers::default(),
+            shock: state.shock,
+            log_path: state.log_path,
         }
     }
 }
@@ -144,6 +193,11 @@ impl PersistedState {
                 },
             },
             preferred_target,
+            triggers: PersistedTriggers {
+                local_player_death: app.death_trigger_enabled,
+                ability_used: app.ability_use_trigger_enabled,
+                ability_cooldown_ready: app.ability_cooldown_ready_trigger_enabled,
+            },
             shock: PersistedShock {
                 mode: app.shock_mode.into(),
                 interval: PersistedShockInterval {
@@ -172,6 +226,9 @@ impl PersistedState {
             .preferred_target
             .as_ref()
             .and_then(|target| target.to_target_id().ok());
+        app.death_trigger_enabled = self.triggers.local_player_death;
+        app.ability_use_trigger_enabled = self.triggers.ability_used;
+        app.ability_cooldown_ready_trigger_enabled = self.triggers.ability_cooldown_ready;
         app.shock_mode = self.shock.mode.into();
         app.min_intensity = self.shock.interval.minimum_intensity;
         app.max_intensity = self.shock.interval.maximum_intensity;
@@ -315,6 +372,7 @@ fn normalize_value(value: f32, minimum: f32, maximum: f32, fallback: f32) -> f32
 pub(crate) struct LoadOutcome {
     pub state: PersistedState,
     pub warning: Option<String>,
+    migrated: bool,
 }
 
 pub(crate) fn default_state_path() -> Result<PathBuf, String> {
@@ -345,6 +403,7 @@ pub(crate) fn load_from_path(path: &Path) -> LoadOutcome {
             return LoadOutcome {
                 state: PersistedState::default(),
                 warning: None,
+                migrated: false,
             };
         }
         Err(error) => {
@@ -360,23 +419,37 @@ pub(crate) fn load_from_path(path: &Path) -> LoadOutcome {
                     "Could not read saved state at {}: {error}. Defaults were restored.",
                     path.display()
                 )),
+                migrated: false,
             };
         }
     };
 
-    let loaded = serde_json::from_str::<PersistedState>(&source)
+    let loaded = serde_json::from_str::<SchemaVersion>(&source)
         .map_err(|error| error.to_string())
-        .and_then(PersistedState::normalized);
+        .and_then(|version| match version.schema_version {
+            1 => serde_json::from_str::<PersistedStateV1>(&source)
+                .map(|state| (PersistedState::from(state), true))
+                .map_err(|error| error.to_string()),
+            SCHEMA_VERSION => serde_json::from_str::<PersistedState>(&source)
+                .map(|state| (state, false))
+                .map_err(|error| error.to_string()),
+            unsupported => Err(format!(
+                "unsupported schema version {unsupported}; expected 1 or {SCHEMA_VERSION}"
+            )),
+        })
+        .and_then(|(state, migrated)| state.normalized().map(|state| (state, migrated)));
     match loaded {
-        Ok(state) => {
+        Ok((state, migrated)) => {
             log::info!(
                 target: "companion::persistence",
-                "settings_load_outcome path={:?} outcome=loaded",
-                path
+                "settings_load_outcome path={:?} outcome=loaded migrated={}",
+                path,
+                migrated
             );
             LoadOutcome {
                 state,
                 warning: None,
+                migrated,
             }
         }
         Err(error) => {
@@ -408,6 +481,7 @@ pub(crate) fn load_from_path(path: &Path) -> LoadOutcome {
                 warning: Some(format!(
                     "Saved state was invalid ({error}). {preservation} Defaults were restored."
                 )),
+                migrated: false,
             }
         }
     }
@@ -593,24 +667,30 @@ pub(crate) struct Persistence {
 
 impl Persistence {
     pub(crate) fn open(path: PathBuf) -> (Self, PersistedState) {
-        let outcome = load_from_path(&path);
-        let state = outcome.state;
+        let LoadOutcome {
+            state,
+            warning,
+            migrated,
+        } = load_from_path(&path);
         log::info!(
             target: "companion::persistence",
-            "settings_opened path={:?} load_warning={}",
+            "settings_opened path={:?} load_warning={} migration_save_pending={}",
             path,
-            outcome.warning.is_some()
+            warning.is_some(),
+            migrated
         );
+        let deadline = migrated.then(|| Instant::now() + SAVE_DEBOUNCE);
+        let pending = migrated.then(|| state.clone());
         (
             Self {
                 path: Some(path),
                 saved: state.clone(),
                 observed: state.clone(),
-                pending: None,
+                pending,
                 pending_reason: SaveReason::Autosave,
-                deadline: None,
+                deadline,
                 debounce: SAVE_DEBOUNCE,
-                load_warning: outcome.warning,
+                load_warning: warning,
                 save_error: None,
             },
             state,
@@ -849,6 +929,9 @@ mod tests {
         original.max_duration = 2.6;
         original.duration = 1.4;
         original.log_path = "/logs/console.log".to_owned();
+        original.death_trigger_enabled = false;
+        original.ability_use_trigger_enabled = true;
+        original.ability_cooldown_ready_trigger_enabled = true;
         original.credential_state = CredentialState::Valid;
         original.devices = vec![ProviderTarget::new(
             TargetId::OpenShock("group-id".to_owned()),
@@ -857,11 +940,14 @@ mod tests {
         original.selected_device = Some(TargetId::OpenShock("group-id".to_owned()));
         let persisted = PersistedState::from_app(&original);
         let json = serde_json::to_string_pretty(&persisted).unwrap();
-        assert!(json.contains("\"schema_version\": 1"));
+        assert!(json.contains("\"schema_version\": 2"));
         assert!(json.contains("\"provider\": \"openshock\""));
         assert!(json.contains("\"id\": \"group-id\""));
         assert!(json.contains("\"interval\""));
         assert!(json.contains("\"fixed\""));
+        assert!(json.contains("\"local_player_death\": false"));
+        assert!(json.contains("\"ability_used\": true"));
+        assert!(json.contains("\"ability_cooldown_ready\": true"));
         assert!(!json.contains("Fetched group"));
 
         let decoded = serde_json::from_str::<PersistedState>(&json)
@@ -875,7 +961,79 @@ mod tests {
         assert!(restored.devices.is_empty());
         assert!(restored.selected_device.is_none());
         assert!(!restored.listener_is_running());
-        assert!(restored.runtime_death_and_shock_state_is_clear());
+        assert!(restored.runtime_trigger_and_shock_state_is_clear());
+    }
+
+    #[test]
+    fn schema_one_migration_preserves_existing_state_and_defaults_new_triggers() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.json");
+        let schema_one = serde_json::json!({
+            "schema_version": 1,
+            "provider": "openshock",
+            "credentials": {
+                "pishock": {
+                    "username": "pi-user",
+                    "api_key": "pi-key"
+                },
+                "openshock": {
+                    "token": "open-token"
+                }
+            },
+            "preferred_target": {
+                "provider": "openshock",
+                "id": "group-id"
+            },
+            "shock": {
+                "mode": "fixed",
+                "interval": {
+                    "minimum_intensity": 11.0,
+                    "maximum_intensity": 72.0,
+                    "minimum_duration_seconds": 0.5,
+                    "maximum_duration_seconds": 2.6
+                },
+                "fixed": {
+                    "intensity": 43.0,
+                    "duration_seconds": 1.4
+                }
+            },
+            "log_path": "/logs/console.log"
+        });
+        fs::write(&path, serde_json::to_vec_pretty(&schema_one).unwrap()).unwrap();
+
+        let outcome = load_from_path(&path);
+        assert!(outcome.warning.is_none());
+        assert_eq!(outcome.state.schema_version, SCHEMA_VERSION);
+        let restored = outcome.state.restore_app();
+        assert_eq!(restored.provider, ProviderKind::OpenShock);
+        assert_eq!(restored.username, "pi-user");
+        assert_eq!(restored.api_key, "pi-key");
+        assert_eq!(restored.openshock_token, "open-token");
+        assert_eq!(
+            restored.preferred_target,
+            Some(TargetId::OpenShock("group-id".to_owned()))
+        );
+        assert_eq!(restored.shock_mode, ShockMode::Fixed);
+        assert_eq!(restored.min_intensity, 11.0);
+        assert_eq!(restored.max_intensity, 72.0);
+        assert_eq!(restored.intensity, 43.0);
+        assert_eq!(restored.min_duration, 0.5);
+        assert_eq!(restored.max_duration, 2.6);
+        assert_eq!(restored.duration, 1.4);
+        assert_eq!(restored.log_path, "/logs/console.log");
+        assert!(restored.death_trigger_enabled);
+        assert!(!restored.ability_use_trigger_enabled);
+        assert!(!restored.ability_cooldown_ready_trigger_enabled);
+
+        let (mut persistence, migrated) = Persistence::open(path.clone());
+        assert_eq!(persistence.pending, Some(migrated.clone()));
+        persistence.flush(migrated).unwrap();
+        let rewritten: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(rewritten["schema_version"], SCHEMA_VERSION);
+        assert_eq!(rewritten["triggers"]["local_player_death"], true);
+        assert_eq!(rewritten["triggers"]["ability_used"], false);
+        assert_eq!(rewritten["triggers"]["ability_cooldown_ready"], false);
     }
 
     #[test]

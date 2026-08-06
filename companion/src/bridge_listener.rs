@@ -33,9 +33,24 @@ pub struct LocalPlayerDeath {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AbilityTrigger {
+    pub schema: u32,
+    pub session_id: String,
+    pub client_time_ms: u64,
+    pub sequence: u64,
+    pub ability_slot: u32,
+    pub ability_name: Option<String>,
+    pub detection: String,
+    pub charges_before: Option<u64>,
+    pub charges_after: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BridgeEvent {
     HookReady(HookReady),
     LocalPlayerDeath(LocalPlayerDeath),
+    AbilityUsed(AbilityTrigger),
+    AbilityCooldownReady(AbilityTrigger),
 }
 
 impl BridgeEvent {
@@ -43,6 +58,8 @@ impl BridgeEvent {
         match self {
             Self::HookReady(_) => "hook_ready",
             Self::LocalPlayerDeath(_) => "local_player_death",
+            Self::AbilityUsed(_) => "ability_used",
+            Self::AbilityCooldownReady(_) => "ability_cooldown_ready",
         }
     }
 }
@@ -64,6 +81,30 @@ enum WireEvent {
         client_time_ms: u64,
         sequence: u64,
         detection: String,
+    },
+    #[serde(rename = "ability_used")]
+    AbilityUsed {
+        schema: u32,
+        session_id: String,
+        client_time_ms: u64,
+        sequence: u64,
+        ability_slot: u32,
+        ability_name: Option<String>,
+        detection: String,
+        charges_before: Option<u64>,
+        charges_after: Option<u64>,
+    },
+    #[serde(rename = "ability_cooldown_ready")]
+    AbilityCooldownReady {
+        schema: u32,
+        session_id: String,
+        client_time_ms: u64,
+        sequence: u64,
+        ability_slot: u32,
+        ability_name: Option<String>,
+        detection: String,
+        charges_before: Option<u64>,
+        charges_after: Option<u64>,
     },
 }
 
@@ -95,6 +136,48 @@ pub fn parse_bridge_record(record: &str) -> Option<BridgeEvent> {
             client_time_ms,
             sequence,
             detection,
+        })),
+        WireEvent::AbilityUsed {
+            schema,
+            session_id,
+            client_time_ms,
+            sequence,
+            ability_slot,
+            ability_name,
+            detection,
+            charges_before,
+            charges_after,
+        } if schema == BRIDGE_SCHEMA => Some(BridgeEvent::AbilityUsed(AbilityTrigger {
+            schema,
+            session_id,
+            client_time_ms,
+            sequence,
+            ability_slot,
+            ability_name,
+            detection,
+            charges_before,
+            charges_after,
+        })),
+        WireEvent::AbilityCooldownReady {
+            schema,
+            session_id,
+            client_time_ms,
+            sequence,
+            ability_slot,
+            ability_name,
+            detection,
+            charges_before,
+            charges_after,
+        } if schema == BRIDGE_SCHEMA => Some(BridgeEvent::AbilityCooldownReady(AbilityTrigger {
+            schema,
+            session_id,
+            client_time_ms,
+            sequence,
+            ability_slot,
+            ability_name,
+            detection,
+            charges_before,
+            charges_after,
         })),
         _ => None,
     }
@@ -752,6 +835,8 @@ mod tests {
 
     const READY_RECORD: &str = "[DEADLOCK_DEATH_HOOK]{\"schema\":1,\"event\":\"hook_ready\",\"session_id\":\"abc-1\",\"client_time_ms\":1700000000000,\"poll_interval_ms\":100}";
     const DEATH_RECORD: &str = "[DEADLOCK_DEATH_HOOK]{\"schema\":1,\"event\":\"local_player_death\",\"session_id\":\"abc-1\",\"client_time_ms\":1700000000123,\"sequence\":7,\"detection\":\"top_bar_local_player_dead_class\"}";
+    const ABILITY_USED_RECORD: &str = "[DEADLOCK_DEATH_HOOK]{\"schema\":1,\"event\":\"ability_used\",\"session_id\":\"abc-1\",\"client_time_ms\":1700000000200,\"sequence\":8,\"ability_slot\":2,\"ability_name\":\"Kinetic Pulse\",\"detection\":\"charge_decrement\",\"charges_before\":3,\"charges_after\":2}";
+    const ABILITY_READY_RECORD: &str = "[DEADLOCK_DEATH_HOOK]{\"schema\":1,\"event\":\"ability_cooldown_ready\",\"session_id\":\"abc-1\",\"client_time_ms\":1700000000300,\"sequence\":9,\"ability_slot\":4,\"detection\":\"cooldown_finished\"}";
 
     #[test]
     fn parser_accepts_exact_mod_payloads_and_console_decoration() {
@@ -774,6 +859,34 @@ mod tests {
                 detection: "top_bar_local_player_dead_class".to_owned(),
             }))
         );
+        assert_eq!(
+            parse_bridge_record(ABILITY_USED_RECORD),
+            Some(BridgeEvent::AbilityUsed(AbilityTrigger {
+                schema: 1,
+                session_id: "abc-1".to_owned(),
+                client_time_ms: 1_700_000_000_200,
+                sequence: 8,
+                ability_slot: 2,
+                ability_name: Some("Kinetic Pulse".to_owned()),
+                detection: "charge_decrement".to_owned(),
+                charges_before: Some(3),
+                charges_after: Some(2),
+            }))
+        );
+        assert_eq!(
+            parse_bridge_record(ABILITY_READY_RECORD),
+            Some(BridgeEvent::AbilityCooldownReady(AbilityTrigger {
+                schema: 1,
+                session_id: "abc-1".to_owned(),
+                client_time_ms: 1_700_000_000_300,
+                sequence: 9,
+                ability_slot: 4,
+                ability_name: None,
+                detection: "cooldown_finished".to_owned(),
+                charges_before: None,
+                charges_after: None,
+            }))
+        );
     }
 
     #[test]
@@ -788,6 +901,24 @@ mod tests {
             None
         );
         assert_eq!(parse_bridge_record("[DEADLOCK_DEATH_HOOK]{bad"), None);
+        assert_eq!(
+            parse_bridge_record(
+                "[DEADLOCK_DEATH_HOOK]{\"schema\":2,\"event\":\"ability_used\",\"session_id\":\"abc-1\",\"client_time_ms\":1,\"sequence\":1,\"ability_slot\":1,\"detection\":\"activated\"}"
+            ),
+            None
+        );
+        assert_eq!(
+            parse_bridge_record(
+                "[DEADLOCK_DEATH_HOOK]{\"schema\":1,\"event\":\"ability_used\",\"session_id\":\"abc-1\",\"client_time_ms\":1,\"sequence\":1,\"detection\":\"activated\"}"
+            ),
+            None
+        );
+        assert_eq!(
+            parse_bridge_record(
+                "[DEADLOCK_DEATH_HOOK]{\"schema\":1,\"event\":\"ability_cooldown_ready\",\"session_id\":\"abc-1\",\"client_time_ms\":1,\"sequence\":1,\"ability_slot\":1,\"detection\":\"charge_restored\",\"charges_before\":\"one\"}"
+            ),
+            None
+        );
     }
 
     #[test]
@@ -806,12 +937,12 @@ mod tests {
         wait_until(|| listener.status().last_activity_at.is_some());
         assert_eq!(listener.status().last_event_at, None);
 
-        append(&path, &format!("{DEATH_RECORD}\n"));
+        append(&path, &format!("{ABILITY_USED_RECORD}\n"));
         assert_eq!(
             events
                 .recv_timeout(Duration::from_secs(2))
-                .expect("death event"),
-            parse_bridge_record(DEATH_RECORD).expect("parse expected death")
+                .expect("ability-used event"),
+            parse_bridge_record(ABILITY_USED_RECORD).expect("parse expected ability use")
         );
         assert!(listener.status().last_event_at.is_some());
     }
@@ -827,24 +958,25 @@ mod tests {
         listener.start(path.clone()).expect("start listener");
         wait_for_phase(&listener, ListenerPhase::Listening);
 
-        append(&path, DEATH_RECORD);
+        append(&path, ABILITY_READY_RECORD);
         wait_until(|| listener.status().last_activity_at.is_some());
         assert_eq!(first.try_recv(), Err(TryRecvError::Empty));
         assert_eq!(second.try_recv(), Err(TryRecvError::Empty));
         append(&path, "\n");
 
-        let death = parse_bridge_record(DEATH_RECORD).expect("parse expected death");
+        let event =
+            parse_bridge_record(ABILITY_READY_RECORD).expect("parse expected ability readiness");
         assert_eq!(
             first
                 .recv_timeout(Duration::from_secs(2))
-                .expect("first death"),
-            death
+                .expect("first ability-readiness event"),
+            event
         );
         assert_eq!(
             second
                 .recv_timeout(Duration::from_secs(2))
-                .expect("second death"),
-            death
+                .expect("second ability-readiness event"),
+            event
         );
 
         let late = listener.subscribe();
@@ -922,23 +1054,23 @@ mod tests {
 
         append(&path, "padding that moves the listener offset\n");
         wait_until(|| listener.status().last_activity_at.is_some());
-        fs::write(&path, format!("{READY_RECORD}\n")).expect("truncate and rewrite log");
+        fs::write(&path, format!("{ABILITY_READY_RECORD}\n")).expect("truncate and rewrite log");
         assert_eq!(
             events
                 .recv_timeout(Duration::from_secs(2))
                 .expect("event after truncation"),
-            parse_bridge_record(READY_RECORD).expect("parse expected ready")
+            parse_bridge_record(ABILITY_READY_RECORD).expect("parse expected ability readiness")
         );
 
         let replacement = temp.path().join("replacement.log");
-        fs::write(&replacement, format!("{DEATH_RECORD}\n")).expect("write replacement");
+        fs::write(&replacement, format!("{ABILITY_USED_RECORD}\n")).expect("write replacement");
         fs::remove_file(&path).expect("remove old log");
         fs::rename(&replacement, &path).expect("install replacement");
         assert_eq!(
             events
                 .recv_timeout(Duration::from_secs(2))
                 .expect("event after replacement"),
-            parse_bridge_record(DEATH_RECORD).expect("parse expected death")
+            parse_bridge_record(ABILITY_USED_RECORD).expect("parse expected ability use")
         );
     }
 
@@ -969,12 +1101,12 @@ mod tests {
         thread::sleep(POLL_INTERVAL * 2);
         assert_eq!(events.try_recv(), Err(TryRecvError::Empty));
 
-        append(&second_path, &format!("{DEATH_RECORD}\n"));
+        append(&second_path, &format!("{ABILITY_USED_RECORD}\n"));
         assert_eq!(
             events
                 .recv_timeout(Duration::from_secs(2))
                 .expect("new-path event"),
-            parse_bridge_record(DEATH_RECORD).expect("parse expected death")
+            parse_bridge_record(ABILITY_USED_RECORD).expect("parse expected ability use")
         );
     }
 
