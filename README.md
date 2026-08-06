@@ -42,13 +42,22 @@ In **Effects**, configure Death, Ability use, and Cooldown ready independently. 
 
 In **Game connection**, auto-detect `console.log` or enter its path, start the listener, and review listener, bridge-event, and delivery diagnostics. Deadlock must run with `-condebug` so the log is written.
 
+The companion shows a persistent amber **Updates available** panel when the locally observed companion or mod version is older than the newest known product version. The companion checks GitHub's stable latest-release endpoint in a worker thread; offline, malformed, or rate-limited responses remain diagnostic-only and never disable gameplay, listener, provider, or shock controls. Legacy or invalid mod metadata receives update/reinstall guidance without numeric comparison.
+
 The companion remembers your setup—including credentials, all three shock profiles, and ability filters—in your OS user config directory. Ability names are runtime diagnostics and are not saved.
 
 ## Publishing a release
 
-The Drone repository needs a `github-token` secret with permission to create releases in this GitHub repository. Push a version tag to start the release pipeline:
+DeadlockShock uses one lockstep Semantic Version for the companion, Panorama mod, Git tag, and GameBanana listing. Before publishing:
+
+1. Choose the release version and update `companion/Cargo.toml` plus `MOD_VERSION` in `mod/panorama/scripts/death_http_bridge.js` together.
+2. Run `bun test tests/death_http_bridge.test.js` and the affected companion tests; the bridge test verifies the cross-component version invariant.
+3. Build and smoke-test the VPK separately on Windows, then publish the mod on [GameBanana](https://gamebanana.com/mods/700758) with the same version.
+4. Push the matching tag only after the mod artifact/version is available:
 
 ```sh
-git tag v0.1.0
-git push origin v0.1.0
+git tag v<version>
+git push origin v<version>
 ```
+
+Drone verifies `DRONE_TAG == v<companion Cargo version>` and the emitted mod metadata before building companion artifacts. The current pipeline does not build or upload the VPK; do not claim a tagged release contains the addon unless it was built and verified separately.

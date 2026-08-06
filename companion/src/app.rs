@@ -8,12 +8,16 @@ use std::time::{Duration, Instant};
 
 use crate::bridge_listener::{
     AbilityTrigger, BridgeEvent, ConsoleLogListener, ListenerPhase, ListenerStatus,
-    LocalPlayerDeath,
+    LocalPlayerDeath, ModVersionObservation,
 };
 use crate::deadlock_path::{self, Detection, DetectionError};
 use crate::persistence::{PersistedState, Persistence, default_state_path};
 use crate::provider::{
     ConnectedProvider, ProviderCredentials, ProviderError, ProviderKind, ProviderTarget, TargetId,
+};
+use crate::version_check::{
+    COMPANION_RELEASE_URL, LATEST_RELEASE_URL, MOD_RELEASE_URL, VersionCheckOwner,
+    VersionCheckState, WarningSelection, app_version, select_warnings,
 };
 use egui::{Color32, TextEdit, Ui};
 use rand::Rng;
@@ -1745,6 +1749,8 @@ pub struct CompanionApp {
     persistence: Persistence,
     reset_confirmation: bool,
     menu_error: Option<String>,
+    version_check: VersionCheckOwner,
+    version_warnings: WarningSelection,
 }
 
 impl CompanionApp {
@@ -1763,9 +1769,17 @@ impl CompanionApp {
                     persistence,
                     reset_confirmation: false,
                     menu_error: None,
+                    version_check: VersionCheckOwner::with_client(LATEST_RELEASE_URL, None),
+                    version_warnings: WarningSelection::default(),
                 }
             }
         }
+    }
+
+    pub fn load_with_context(context: egui::Context) -> Self {
+        let mut app = Self::load();
+        app.version_check = VersionCheckOwner::new(&context);
+        app
     }
 
     pub(crate) fn load_from_path(path: PathBuf) -> Self {
@@ -1775,10 +1789,22 @@ impl CompanionApp {
             persistence,
             reset_confirmation: false,
             menu_error: None,
+            version_check: VersionCheckOwner::with_client(LATEST_RELEASE_URL, None),
+            version_warnings: WarningSelection::default(),
         }
     }
 
     pub fn draw(&mut self, ui: &mut Ui) {
+        self.version_check.poll();
+        let listener_status = self.state.bridge_listener.status();
+        let remote = match &self.version_check.state {
+            VersionCheckState::Current { latest }
+            | VersionCheckState::UpdateAvailable { latest } => Some(latest),
+            _ => None,
+        };
+        self.version_warnings =
+            select_warnings(&app_version(), &listener_status.mod_version, remote);
+
         self.draw_menu(ui);
         if let Some(warning) = self.persistence.load_warning() {
             status_line(ui, warning, [0.92, 0.68, 0.22, 1.0]);
@@ -1789,6 +1815,7 @@ impl CompanionApp {
         if let Some(error) = &self.menu_error {
             status_line(ui, error, [0.92, 0.32, 0.28, 1.0]);
         }
+        self.draw_update_panel(ui);
         egui::ScrollArea::vertical().show(ui, |ui| {
             egui::Frame::NONE.inner_margin(8.0).show(ui, |ui| {
                 self.state.draw(ui);
@@ -1802,8 +1829,55 @@ impl CompanionApp {
         {
             ui.ctx().request_repaint_after(delay);
         }
+        if self.version_check.is_checking() {
+            ui.ctx().request_repaint_after(Duration::from_millis(250));
+        }
     }
 
+    fn draw_update_panel(&self, ui: &mut Ui) {
+        let has_warning = self.version_warnings.companion_outdated.is_some()
+            || self.version_warnings.mod_outdated.is_some()
+            || self.version_warnings.mod_legacy
+            || self.version_warnings.mod_invalid;
+        if !has_warning {
+            return;
+        }
+        egui::Frame::group(ui.style())
+            .fill(Color32::from_rgb(86, 64, 22))
+            .inner_margin(8.0)
+            .show(ui, |ui| {
+                ui.strong("Updates available");
+                if let Some(target) = &self.version_warnings.companion_outdated {
+                    ui.horizontal(|ui| {
+                        ui.label(format!(
+                            "Companion {} is older than {}.",
+                            app_version(),
+                            target
+                        ));
+                        ui.hyperlink_to("Download companion", COMPANION_RELEASE_URL);
+                    });
+                }
+                if let Some((installed, target)) = &self.version_warnings.mod_outdated {
+                    ui.horizontal(|ui| {
+                        ui.label(format!(
+                            "DeadlockShock mod {} is older than {}.",
+                            installed, target
+                        ));
+                        ui.hyperlink_to("Update mod", MOD_RELEASE_URL);
+                    });
+                } else if self.version_warnings.mod_legacy {
+                    ui.horizontal(|ui| {
+                        ui.label("The last observed DeadlockShock mod predates version reporting.");
+                        ui.hyperlink_to("Update mod", MOD_RELEASE_URL);
+                    });
+                } else if self.version_warnings.mod_invalid {
+                    ui.horizontal(|ui| {
+                        ui.label("The last observed DeadlockShock mod reported an invalid version; reinstall the latest mod.");
+                        ui.hyperlink_to("Update mod", MOD_RELEASE_URL);
+                    });
+                }
+            });
+    }
     pub fn flush_pending(&mut self) {
         log::info!(target: "companion::app", "settings_flush_boundary reason=application_exit");
         let result = self
@@ -1813,11 +1887,38 @@ impl CompanionApp {
             log::warn!(target: "companion::app", "settings_flush_boundary outcome=failed");
         }
     }
-
     fn draw_menu(&mut self, ui: &mut Ui) {
         let reset_available = !self.state.is_busy();
         egui::MenuBar::new().ui(ui, |ui| {
             ui.menu_button("Menu", |ui| {
+                ui.label(format!("Companion version: {}", app_version()));
+                let mod_label = match &self.state.bridge_listener.status().mod_version {
+                    ModVersionObservation::Unknown => "unknown".to_owned(),
+                    ModVersionObservation::Legacy => "legacy (no version reporting)".to_owned(),
+                    ModVersionObservation::Invalid => "invalid".to_owned(),
+                    ModVersionObservation::Reported(version) => format!("last observed {version}"),
+                };
+                ui.label(format!("Mod version: {mod_label}"));
+                match &self.version_check.state {
+                    VersionCheckState::Checking => ui.label("Latest stable: checking…"),
+                    VersionCheckState::Current { latest } => {
+                        ui.label(format!("Latest stable: {latest} (current)"))
+                    }
+                    VersionCheckState::UpdateAvailable { latest } => {
+                        ui.label(format!("Latest stable: {latest} (update available)"))
+                    }
+                    VersionCheckState::Unavailable { reason } => {
+                        ui.label(format!("Latest stable: unavailable ({reason})"))
+                    }
+                };
+                let checking = self.version_check.is_checking();
+                if ui
+                    .add_enabled(!checking, egui::Button::new("Check for updates"))
+                    .clicked()
+                {
+                    self.version_check.start(ui.ctx().clone());
+                }
+                ui.separator();
                 if ui.button("Open config folder").clicked() {
                     log::info!(target: "companion::app", "config_folder_open_requested");
                     self.menu_error = self.persistence.open_config_directory().err();

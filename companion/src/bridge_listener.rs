@@ -6,7 +6,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use semver::Version;
 use serde::Deserialize;
+use serde_json::Value;
 
 pub const BRIDGE_RECORD_PREFIX: &str = "[DEADLOCK_DEATH_HOOK]";
 pub const BRIDGE_SCHEMA: u32 = 1;
@@ -14,6 +16,47 @@ const POLL_INTERVAL: Duration = Duration::from_millis(20);
 const MAX_INCOMPLETE_LINE_BYTES: usize = 256 * 1024;
 const READ_BUFFER_BYTES: usize = 16 * 1024;
 const TAIL_CHECKPOINT_BYTES: usize = 64;
+const MAX_METADATA_VERSION_BYTES: usize = 64;
+const HISTORICAL_SCAN_BYTES: usize = 64 * 1024;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ModVersionObservation {
+    Unknown,
+    Legacy,
+    Invalid,
+    Reported(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BridgeMetadata {
+    pub schema: u32,
+    pub event: String,
+    pub mod_version: ModVersionObservation,
+}
+
+pub fn parse_bridge_metadata(record: &str) -> Option<BridgeMetadata> {
+    let prefix_at = record.find(BRIDGE_RECORD_PREFIX)?;
+    let payload = &record[prefix_at + BRIDGE_RECORD_PREFIX.len()..];
+    let value: Value = serde_json::from_str(payload).ok()?;
+    let schema = value.get("schema")?.as_u64()?.try_into().ok()?;
+    let event = value.get("event")?.as_str()?.to_owned();
+    let mod_version = match value.get("mod_version") {
+        None => ModVersionObservation::Legacy,
+        Some(Value::String(version))
+            if !version.is_empty()
+                && version.len() <= MAX_METADATA_VERSION_BYTES
+                && Version::parse(version).is_ok() =>
+        {
+            ModVersionObservation::Reported(version.clone())
+        }
+        Some(_) => ModVersionObservation::Invalid,
+    };
+    Some(BridgeMetadata {
+        schema,
+        event,
+        mod_version,
+    })
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HookReady {
@@ -245,6 +288,7 @@ pub struct ListenerStatus {
     pub current_error: Option<String>,
     pub last_activity_at: Option<Instant>,
     pub last_event_at: Option<Instant>,
+    pub mod_version: ModVersionObservation,
 }
 
 impl Default for ListenerStatus {
@@ -255,6 +299,7 @@ impl Default for ListenerStatus {
             current_error: None,
             last_activity_at: None,
             last_event_at: None,
+            mod_version: ModVersionObservation::Unknown,
         }
     }
 }
@@ -334,7 +379,7 @@ impl ConsoleLogListener {
             );
         }
         self.stop();
-        let (initial_log, skip_first_success) = match open_log_file(&path, true) {
+        let (mut initial_log, skip_first_success) = match open_log_file(&path, true) {
             Ok(log) => (Some(log), false),
             Err(error) if error.kind() == io::ErrorKind::NotFound => (None, false),
             Err(error) => {
@@ -359,6 +404,15 @@ impl ConsoleLogListener {
             status.current_error = None;
             status.last_activity_at = None;
             status.last_event_at = None;
+            status.mod_version = ModVersionObservation::Unknown;
+        }
+        if let Some(log) = initial_log.as_mut()
+            && let Err(error) = seed_metadata_from_tail(log, &self.status)
+        {
+            log::warn!(
+                target: "companion::bridge_listener",
+                "bridge_metadata_seed_failed error_kind=io error={error:?}"
+            );
         }
         log::info!(
             target: "companion::bridge_listener",
@@ -414,6 +468,7 @@ impl ConsoleLogListener {
         let mut status = lock_unpoisoned(&self.status);
         status.phase = ListenerPhase::Stopped;
         status.current_error = None;
+        status.mod_version = ModVersionObservation::Unknown;
         if had_worker || previous_phase != ListenerPhase::Stopped {
             log::info!(
                 target: "companion::bridge_listener",
@@ -472,6 +527,9 @@ fn worker_loop(
     mut skip_first_success: bool,
 ) {
     let mut read_buffer = [0_u8; READ_BUFFER_BYTES];
+    if let Some(log) = open_log.as_mut() {
+        let _ = seed_metadata_from_tail(log, &status);
+    }
 
     loop {
         if stop.try_recv().is_ok() {
@@ -482,9 +540,11 @@ fn worker_loop(
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 skip_first_success = false;
                 open_log = None;
+                clear_mod_observation(&status);
                 set_phase(&status, ListenerPhase::WaitingForFile, None);
             }
             Err(error) => {
+                clear_mod_observation(&status);
                 set_phase(
                     &status,
                     ListenerPhase::Failed,
@@ -493,6 +553,7 @@ fn worker_loop(
             }
             Ok(metadata) if !metadata.is_file() => {
                 open_log = None;
+                clear_mod_observation(&status);
                 set_phase(
                     &status,
                     ListenerPhase::Failed,
@@ -512,11 +573,16 @@ fn worker_loop(
                         path
                     );
                     open_log = None;
+                    clear_mod_observation(&status);
                 }
 
                 if open_log.is_none() {
+                    let seed_metadata = skip_first_success;
                     match open_log_file(&path, skip_first_success) {
-                        Ok(log) => {
+                        Ok(mut log) => {
+                            if seed_metadata {
+                                let _ = seed_metadata_from_tail(&mut log, &status);
+                            }
                             open_log = Some(log);
                             skip_first_success = false;
                             set_phase(&status, ListenerPhase::Listening, None);
@@ -531,10 +597,15 @@ fn worker_loop(
                     }
                 }
 
+                let offset_before = open_log.as_ref().map(|log| log.offset);
                 let truncation_error = open_log
                     .as_mut()
                     .and_then(|log| ensure_not_truncated(log, path_metadata.len()).err());
+                if offset_before != open_log.as_ref().map(|log| log.offset) {
+                    clear_mod_observation(&status);
+                }
                 if let Some(error) = truncation_error {
+                    clear_mod_observation(&status);
                     set_phase(
                         &status,
                         ListenerPhase::Failed,
@@ -666,10 +737,13 @@ fn read_available(
         log.offset += bytes_read as u64;
         update_checkpoint(&mut log.checkpoint, &read_buffer[..bytes_read]);
         lock_unpoisoned(status).last_activity_at = Some(Instant::now());
-        consume_bytes(
+        consume_bytes_with_metadata(
             &mut log.incomplete_line,
             &mut log.discarding_oversized_line,
             &read_buffer[..bytes_read],
+            |metadata| {
+                lock_unpoisoned(status).mod_version = metadata.mod_version;
+            },
             |event| {
                 let mut listener_status = lock_unpoisoned(status);
                 if broadcast(subscribers, event) {
@@ -680,10 +754,27 @@ fn read_available(
     }
 }
 
+#[cfg(test)]
 fn consume_bytes(
     incomplete_line: &mut Vec<u8>,
     discarding_oversized_line: &mut bool,
     bytes: &[u8],
+    deliver: impl FnMut(BridgeEvent),
+) {
+    consume_bytes_with_metadata(
+        incomplete_line,
+        discarding_oversized_line,
+        bytes,
+        |_| {},
+        deliver,
+    );
+}
+
+fn consume_bytes_with_metadata(
+    incomplete_line: &mut Vec<u8>,
+    discarding_oversized_line: &mut bool,
+    bytes: &[u8],
+    mut observe: impl FnMut(BridgeMetadata),
     mut deliver: impl FnMut(BridgeEvent),
 ) {
     for byte in bytes {
@@ -701,6 +792,9 @@ fn consume_bytes(
             match std::str::from_utf8(line) {
                 Ok(line) => {
                     if line.contains(BRIDGE_RECORD_PREFIX) {
+                        if let Some(metadata) = parse_bridge_metadata(line) {
+                            observe(metadata);
+                        }
                         match parse_bridge_record(line) {
                             Some(event) => deliver(event),
                             None => log_rejected_bridge_record(line),
@@ -758,6 +852,44 @@ fn log_rejected_bridge_record(line: &str) {
         target: "companion::bridge_listener",
         "bridge_record_rejected reason={reason}"
     );
+}
+
+fn clear_mod_observation(status: &Arc<Mutex<ListenerStatus>>) {
+    lock_unpoisoned(status).mod_version = ModVersionObservation::Unknown;
+}
+
+fn seed_metadata_from_tail(
+    log: &mut OpenLog,
+    status: &Arc<Mutex<ListenerStatus>>,
+) -> io::Result<()> {
+    let end = log.offset;
+    let start = end.saturating_sub(HISTORICAL_SCAN_BYTES as u64);
+    log.file.seek(SeekFrom::Start(start))?;
+    let mut bytes = Vec::with_capacity((end - start) as usize);
+    log.file
+        .by_ref()
+        .take(end - start)
+        .read_to_end(&mut bytes)?;
+    log.file.seek(SeekFrom::Start(end))?;
+    let complete_len = bytes
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |newline| newline + 1);
+    let complete = &bytes[..complete_len];
+    let mut lines = complete.split(|byte| *byte == b'\n');
+    if start > 0 {
+        let _ = lines.next();
+    }
+    let newest = lines.filter_map(|line| {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        std::str::from_utf8(line)
+            .ok()
+            .and_then(parse_bridge_metadata)
+    });
+    if let Some(metadata) = newest.last() {
+        lock_unpoisoned(status).mod_version = metadata.mod_version;
+    }
+    Ok(())
 }
 
 fn broadcast(subscribers: &Arc<Mutex<Vec<Sender<BridgeEvent>>>>, event: BridgeEvent) -> bool {
@@ -880,11 +1012,73 @@ mod tests {
     use std::sync::mpsc::TryRecvError;
 
     const READY_RECORD: &str = "[DEADLOCK_DEATH_HOOK]{\"schema\":1,\"event\":\"hook_ready\",\"session_id\":\"abc-1\",\"client_time_ms\":1700000000000,\"poll_interval_ms\":100}";
+    const VERSIONED_READY_RECORD: &str = "[DEADLOCK_DEATH_HOOK]{\"schema\":1,\"event\":\"hook_ready\",\"mod_version\":\"0.1.0\",\"session_id\":\"abc-1\",\"client_time_ms\":1700000000000,\"poll_interval_ms\":100}";
     const CATALOG_RECORD: &str = "[DEADLOCK_DEATH_HOOK]{\"schema\":1,\"event\":\"ability_catalog\",\"session_id\":\"abc-1\",\"client_time_ms\":1700000000100,\"abilities\":[{\"ability_slot\":1,\"ability_name\":\"Kinetic Pulse\"},{\"ability_slot\":5}]}";
     const DEATH_RECORD: &str = "[DEADLOCK_DEATH_HOOK]{\"schema\":1,\"event\":\"local_player_death\",\"session_id\":\"abc-1\",\"client_time_ms\":1700000000123,\"sequence\":7,\"detection\":\"top_bar_local_player_dead_class\"}";
     const ABILITY_USED_RECORD: &str = "[DEADLOCK_DEATH_HOOK]{\"schema\":1,\"event\":\"ability_used\",\"session_id\":\"abc-1\",\"client_time_ms\":1700000000200,\"sequence\":8,\"ability_slot\":2,\"ability_name\":\"Kinetic Pulse\",\"detection\":\"charge_decrement\",\"charges_before\":3,\"charges_after\":2}";
     const ABILITY_READY_RECORD: &str = "[DEADLOCK_DEATH_HOOK]{\"schema\":1,\"event\":\"ability_cooldown_ready\",\"session_id\":\"abc-1\",\"client_time_ms\":1700000000300,\"sequence\":9,\"ability_slot\":4,\"detection\":\"cooldown_finished\"}";
 
+    #[test]
+    fn metadata_parser_accepts_versions_without_accepting_future_events() {
+        let record = "[DEADLOCK_DEATH_HOOK]{\"schema\":9,\"event\":\"future_event\",\"mod_version\":\"0.2.0\"}";
+        assert_eq!(
+            parse_bridge_metadata(record),
+            Some(BridgeMetadata {
+                schema: 9,
+                event: "future_event".to_owned(),
+                mod_version: ModVersionObservation::Reported("0.2.0".to_owned()),
+            })
+        );
+        assert_eq!(parse_bridge_record(record), None);
+    }
+
+    #[test]
+    fn metadata_parser_distinguishes_legacy_invalid_and_malformed() {
+        let legacy =
+            "[DEADLOCK_DEATH_HOOK]{\"schema\":1,\"event\":\"hook_ready\",\"mod_version\":null}";
+        assert_eq!(
+            parse_bridge_metadata(legacy).map(|metadata| metadata.mod_version),
+            Some(ModVersionObservation::Invalid)
+        );
+        let missing = "[DEADLOCK_DEATH_HOOK]{\"schema\":1,\"event\":\"hook_ready\"}";
+        assert_eq!(
+            parse_bridge_metadata(missing).map(|metadata| metadata.mod_version),
+            Some(ModVersionObservation::Legacy)
+        );
+        assert_eq!(parse_bridge_metadata("[DEADLOCK_DEATH_HOOK]{bad}"), None);
+        let invalid_semver =
+            "[DEADLOCK_DEATH_HOOK]{\"schema\":1,\"event\":\"hook_ready\",\"mod_version\":\"new\"}";
+        assert_eq!(
+            parse_bridge_metadata(invalid_semver).map(|metadata| metadata.mod_version),
+            Some(ModVersionObservation::Invalid)
+        );
+        let oversized = format!(
+            "[DEADLOCK_DEATH_HOOK]{{\"schema\":1,\"event\":\"hook_ready\",\"mod_version\":\"{}\"}}",
+            "1".repeat(MAX_METADATA_VERSION_BYTES + 1)
+        );
+        assert_eq!(
+            parse_bridge_metadata(&oversized).map(|metadata| metadata.mod_version),
+            Some(ModVersionObservation::Invalid)
+        );
+    }
+
+    #[test]
+    fn version_metadata_does_not_change_supported_gameplay_events() {
+        for record in [
+            READY_RECORD,
+            CATALOG_RECORD,
+            DEATH_RECORD,
+            ABILITY_USED_RECORD,
+            ABILITY_READY_RECORD,
+        ] {
+            let versioned = record.replacen(
+                "{\"schema\":1,",
+                "{\"schema\":1,\"mod_version\":\"0.1.0\",",
+                1,
+            );
+            assert_eq!(parse_bridge_record(&versioned), parse_bridge_record(record));
+        }
+    }
     #[test]
     fn parser_accepts_exact_mod_payloads_and_console_decoration() {
         assert_eq!(
@@ -987,10 +1181,11 @@ mod tests {
     }
 
     #[test]
-    fn existing_history_is_skipped_and_activity_requires_new_bytes() {
+    fn existing_history_seeds_only_metadata_and_activity_requires_new_bytes() {
         let temp = tempfile::tempdir().expect("temporary directory");
         let path = temp.path().join("console.log");
-        fs::write(&path, format!("{READY_RECORD}\n")).expect("write history");
+        fs::write(&path, format!("{DEATH_RECORD}\n{VERSIONED_READY_RECORD}\n"))
+            .expect("write history");
         let mut listener = ConsoleLogListener::new();
         let events = listener.subscribe();
         listener.start(path.clone()).expect("start listener");
@@ -998,6 +1193,12 @@ mod tests {
 
         assert_eq!(events.try_recv(), Err(TryRecvError::Empty));
         assert_eq!(listener.status().last_activity_at, None);
+        assert_eq!(listener.status().last_event_at, None);
+        assert_eq!(
+            listener.status().mod_version,
+            ModVersionObservation::Reported("0.1.0".to_owned())
+        );
+
         append(&path, "unrelated output\n");
         wait_until(|| listener.status().last_activity_at.is_some());
         assert_eq!(listener.status().last_event_at, None);
@@ -1010,6 +1211,95 @@ mod tests {
             parse_bridge_record(ABILITY_USED_RECORD).expect("parse expected ability use")
         );
         assert!(listener.status().last_event_at.is_some());
+    }
+
+    #[test]
+    fn historical_scan_uses_bounded_complete_newest_metadata() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let path = temp.path().join("console.log");
+        let mut history = vec![b'x'; HISTORICAL_SCAN_BYTES + 17];
+        history.extend_from_slice(b"\n");
+        history.extend_from_slice(
+            b"[DEADLOCK_DEATH_HOOK]{\"schema\":1,\"event\":\"hook_ready\",\"mod_version\":\"0.1.0\"}\r\n",
+        );
+        history.extend_from_slice(b"[DEADLOCK_DEATH_HOOK]{bad}\r\n");
+        history.extend_from_slice(
+            b"[DEADLOCK_DEATH_HOOK]{\"schema\":9,\"event\":\"future\",\"mod_version\":\"0.2.0\"}\r\n",
+        );
+        history.extend_from_slice(
+            b"[DEADLOCK_DEATH_HOOK]{\"schema\":9,\"event\":\"partial\",\"mod_version\":\"9.0.0\"}",
+        );
+        fs::write(&path, history).expect("write bounded history");
+
+        let mut listener = ConsoleLogListener::new();
+        let events = listener.subscribe();
+        listener.start(path).expect("start listener");
+        wait_for_phase(&listener, ListenerPhase::Listening);
+
+        assert_eq!(
+            listener.status().mod_version,
+            ModVersionObservation::Reported("0.2.0".to_owned())
+        );
+        assert_eq!(listener.status().last_activity_at, None);
+        assert_eq!(listener.status().last_event_at, None);
+        assert_eq!(events.try_recv(), Err(TryRecvError::Empty));
+    }
+
+    #[test]
+    fn historical_scan_stays_bounded_when_metadata_is_outside_window() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let path = temp.path().join("console.log");
+        let mut history = format!("{VERSIONED_READY_RECORD}\n").into_bytes();
+        history.extend(std::iter::repeat_n(b'x', HISTORICAL_SCAN_BYTES + 1));
+        history.push(b'\n');
+        fs::write(&path, history).expect("write oversized history");
+
+        let mut listener = ConsoleLogListener::new();
+        let events = listener.subscribe();
+        listener.start(path).expect("start listener");
+        wait_for_phase(&listener, ListenerPhase::Listening);
+
+        assert_eq!(
+            listener.status().mod_version,
+            ModVersionObservation::Unknown
+        );
+        assert_eq!(events.try_recv(), Err(TryRecvError::Empty));
+    }
+
+    #[test]
+    fn live_future_and_invalid_metadata_update_status_without_delivery() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let path = temp.path().join("console.log");
+        File::create(&path).expect("create log");
+        let mut listener = ConsoleLogListener::new();
+        let events = listener.subscribe();
+        listener.start(path.clone()).expect("start listener");
+        wait_for_phase(&listener, ListenerPhase::Listening);
+
+        append(&path, "[DEADLOCK_DEATH_HOOK]{bad}\n");
+        wait_until(|| listener.status().last_activity_at.is_some());
+        assert_eq!(
+            listener.status().mod_version,
+            ModVersionObservation::Unknown
+        );
+        assert_eq!(events.try_recv(), Err(TryRecvError::Empty));
+
+        append(
+            &path,
+            "[DEADLOCK_DEATH_HOOK]{\"schema\":9,\"event\":\"future\",\"mod_version\":\"0.2.0\"}\n",
+        );
+        wait_until(|| {
+            listener.status().mod_version == ModVersionObservation::Reported("0.2.0".to_owned())
+        });
+        assert_eq!(events.try_recv(), Err(TryRecvError::Empty));
+
+        append(
+            &path,
+            "[DEADLOCK_DEATH_HOOK]{\"schema\":9,\"event\":\"future\",\"mod_version\":\"invalid\"}\n",
+        );
+        wait_until(|| listener.status().mod_version == ModVersionObservation::Invalid);
+        assert_eq!(events.try_recv(), Err(TryRecvError::Empty));
+        assert_eq!(listener.status().last_event_at, None);
     }
 
     #[test]
@@ -1184,10 +1474,25 @@ mod tests {
         let events = listener.subscribe();
         listener.start(path.clone()).expect("start listener");
         wait_for_phase(&listener, ListenerPhase::Listening);
+        append(&path, &format!("{VERSIONED_READY_RECORD}\n"));
+        events
+            .recv_timeout(Duration::from_secs(2))
+            .expect("live versioned ready event");
+        wait_until(|| {
+            listener.status().mod_version == ModVersionObservation::Reported("0.1.0".to_owned())
+        });
         listener.start(path.clone()).expect("same-path no-op");
+        assert_eq!(
+            listener.status().mod_version,
+            ModVersionObservation::Reported("0.1.0".to_owned())
+        );
         listener.stop();
 
         assert_eq!(listener.status().phase, ListenerPhase::Stopped);
+        assert_eq!(
+            listener.status().mod_version,
+            ModVersionObservation::Unknown
+        );
         append(&path, &format!("{READY_RECORD}\n"));
         thread::sleep(POLL_INTERVAL * 2);
         assert_eq!(events.try_recv(), Err(TryRecvError::Empty));

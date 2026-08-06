@@ -3,6 +3,7 @@ pub mod bridge_listener;
 pub mod deadlock_path;
 pub mod persistence;
 pub mod provider;
+pub mod version_check;
 use app::CompanionApp;
 use eframe::egui;
 
@@ -62,7 +63,11 @@ fn main() -> eframe::Result {
     let result = eframe::run_native(
         "DeadlockShock Companion",
         options,
-        Box::new(|_creation_context| Ok(Box::new(CompanionApp::load()))),
+        Box::new(|creation_context| {
+            Ok(Box::new(CompanionApp::load_with_context(
+                creation_context.egui_ctx.clone(),
+            )))
+        }),
     );
     match &result {
         Ok(()) => log::info!(target: "companion", "process_exit status=success"),

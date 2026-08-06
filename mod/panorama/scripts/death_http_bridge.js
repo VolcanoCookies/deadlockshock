@@ -2,6 +2,7 @@
     "use strict";
 
     var LOG_PREFIX = "[DEADLOCK_DEATH_HOOK]";
+    var MOD_VERSION = "0.1.0";
     var POLL_INTERVAL_SECONDS = 0.1;
     var context = $.GetContextPanel();
     var localPlayerPanel = null;
@@ -19,6 +20,7 @@
         var payload = {
             schema: 1,
             event: eventName,
+            mod_version: MOD_VERSION,
             session_id: sessionId,
             client_time_ms: Date.now()
         };

@@ -394,6 +394,8 @@ dependencies = [
  "openshock",
  "pishock",
  "rand 0.9.5",
+ "reqwest",
+ "semver",
  "serde",
  "serde_json",
  "steamlocate",
