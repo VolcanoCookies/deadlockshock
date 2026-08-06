@@ -12,6 +12,7 @@
     var abilityHeroIdentity = null;
     var abilityPanels = [];
     var abilityStates = [];
+    var lastAbilityCatalogSignature = null;
     var sessionId = Date.now().toString(36) + "-" + Math.floor(Math.random() * 0x1000000).toString(36);
 
     function emit(eventName, fields) {
@@ -268,6 +269,34 @@
         }
     }
 
+    function emitAbilityCatalog(forceRefresh) {
+        var abilities = [];
+        for (var i = 0; i < abilityStates.length; i++) {
+            var snapshot = abilityStates[i];
+            if (!snapshot) {
+                continue;
+            }
+            var ability = {
+                ability_slot: snapshot.slot
+            };
+            if (typeof snapshot.name === "string" && snapshot.name !== "") {
+                ability.ability_name = snapshot.name;
+            }
+            abilities.push(ability);
+        }
+        if (abilities.length === 0) {
+            return;
+        }
+        var signature = JSON.stringify(abilities);
+        if (!forceRefresh && signature === lastAbilityCatalogSignature) {
+            return;
+        }
+        lastAbilityCatalogSignature = signature;
+        emit("ability_catalog", {
+            abilities: abilities
+        });
+    }
+
     function samePanelSet(panels) {
         if (panels.length !== abilityPanels.length) {
             return false;
@@ -342,15 +371,22 @@
 
         var panels = abilityEntries(root);
         var currentHeroIdentity = heroIdentity(root);
-        if (forceBaseline || abilityRoot !== root || !samePanelSet(panels) || currentHeroIdentity !== abilityHeroIdentity) {
+        var rootReplaced = abilityRoot !== root;
+        var panelsReplaced = !samePanelSet(panels);
+        var heroReplaced = currentHeroIdentity !== abilityHeroIdentity;
+        if (forceBaseline || rootReplaced || panelsReplaced || heroReplaced) {
             baselineAbilityPanels(root, panels);
+            emitAbilityCatalog(rootReplaced || panelsReplaced || heroReplaced);
             return;
         }
 
+        var catalogueChanged = false;
+        var catalogueReplaced = false;
         for (var slotIndex = 0; slotIndex < panels.length; slotIndex++) {
             var current = abilitySnapshot(panels[slotIndex], slotIndex);
             var previous = abilityStates[slotIndex];
             if (!current || !previous) {
+                catalogueChanged = catalogueChanged || (!!current !== !!previous);
                 abilityStates[slotIndex] = current;
                 continue;
             }
@@ -360,12 +396,18 @@
                 || current.tier !== previous.tier
                 || current.charged !== previous.charged
                 || current.max_charges !== previous.max_charges) {
+                catalogueReplaced = catalogueReplaced || current.identity !== previous.identity;
+                catalogueChanged = catalogueChanged || current.name !== previous.name;
                 abilityStates[slotIndex] = current;
                 continue;
             }
 
+            catalogueChanged = catalogueChanged || current.name !== previous.name;
             detectAbilityTransitions(previous, current);
             abilityStates[slotIndex] = current;
+        }
+        if (catalogueChanged || catalogueReplaced) {
+            emitAbilityCatalog(catalogueReplaced);
         }
     }
 

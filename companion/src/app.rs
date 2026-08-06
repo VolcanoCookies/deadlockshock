@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::RangeInclusive;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -61,6 +62,163 @@ impl ShockMode {
         match self {
             Self::Interval => "Interval",
             Self::Fixed => "Fixed",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ShockIntervalSettings {
+    pub minimum_intensity: f32,
+    pub maximum_intensity: f32,
+    pub minimum_duration_seconds: f32,
+    pub maximum_duration_seconds: f32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ShockFixedSettings {
+    pub intensity: f32,
+    pub duration_seconds: f32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ShockSettings {
+    pub mode: ShockMode,
+    pub interval: ShockIntervalSettings,
+    pub fixed: ShockFixedSettings,
+}
+
+impl Default for ShockSettings {
+    fn default() -> Self {
+        Self {
+            mode: ShockMode::default(),
+            interval: ShockIntervalSettings {
+                minimum_intensity: MIN_SHOCK_INTENSITY,
+                maximum_intensity: MIN_SHOCK_INTENSITY,
+                minimum_duration_seconds: MIN_SHOCK_DURATION,
+                maximum_duration_seconds: MIN_SHOCK_DURATION,
+            },
+            fixed: ShockFixedSettings {
+                intensity: MIN_SHOCK_INTENSITY,
+                duration_seconds: MIN_SHOCK_DURATION,
+            },
+        }
+    }
+}
+
+impl ShockSettings {
+    pub fn resolve(&self) -> Option<ResolvedShock> {
+        let mut rng = rand::rng();
+        self.resolve_with(&mut rng)
+    }
+
+    fn resolve_with<R: Rng + ?Sized>(&self, rng: &mut R) -> Option<ResolvedShock> {
+        let intensity = match self.mode {
+            ShockMode::Fixed => portable_intensity(self.fixed.intensity)?,
+            ShockMode::Interval => {
+                let minimum = portable_intensity(self.interval.minimum_intensity)?;
+                let maximum = portable_intensity(self.interval.maximum_intensity)?;
+                if minimum > maximum {
+                    return None;
+                }
+                rng.random_range(minimum..=maximum)
+            }
+        };
+        let duration_ms = match self.mode {
+            ShockMode::Fixed => portable_duration(self.fixed.duration_seconds)?,
+            ShockMode::Interval => {
+                let minimum = portable_duration(self.interval.minimum_duration_seconds)?;
+                let maximum = portable_duration(self.interval.maximum_duration_seconds)?;
+                if minimum > maximum {
+                    return None;
+                }
+                rng.random_range(minimum..=maximum)
+            }
+        };
+        Some(ResolvedShock {
+            intensity,
+            duration_ms,
+        })
+    }
+
+    fn summary(&self) -> String {
+        match self.mode {
+            ShockMode::Fixed => format!(
+                "{:.0}% for {:.1} s",
+                self.fixed.intensity, self.fixed.duration_seconds
+            ),
+            ShockMode::Interval => format!(
+                "{:.0}–{:.0}% for {:.1}–{:.1} s",
+                self.interval.minimum_intensity,
+                self.interval.maximum_intensity,
+                self.interval.minimum_duration_seconds,
+                self.interval.maximum_duration_seconds
+            ),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct TriggerSettings {
+    pub enabled: bool,
+    pub shock: ShockSettings,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AbilityFilter {
+    All,
+    Selected(BTreeSet<u32>),
+}
+
+impl Default for AbilityFilter {
+    fn default() -> Self {
+        Self::All
+    }
+}
+
+impl AbilityFilter {
+    pub fn accepts(&self, ability_slot: u32) -> bool {
+        match self {
+            Self::All => true,
+            Self::Selected(slots) => slots.contains(&ability_slot),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AbilityTriggerSettings {
+    pub trigger: TriggerSettings,
+    pub ability_filter: AbilityFilter,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct TriggerSettingsSet {
+    pub death: TriggerSettings,
+    pub ability_use: AbilityTriggerSettings,
+    pub ability_cooldown_ready: AbilityTriggerSettings,
+}
+
+impl Default for TriggerSettingsSet {
+    fn default() -> Self {
+        let shock = ShockSettings::default();
+        Self {
+            death: TriggerSettings {
+                enabled: true,
+                shock: shock.clone(),
+            },
+            ability_use: AbilityTriggerSettings {
+                trigger: TriggerSettings {
+                    enabled: false,
+                    shock: shock.clone(),
+                },
+                ability_filter: AbilityFilter::All,
+            },
+            ability_cooldown_ready: AbilityTriggerSettings {
+                trigger: TriggerSettings {
+                    enabled: false,
+                    shock,
+                },
+                ability_filter: AbilityFilter::All,
+            },
         }
     }
 }
@@ -141,6 +299,60 @@ impl TriggerKind {
             Self::Death => "death",
             Self::AbilityUse => "ability use",
             Self::AbilityCooldownReady => "ability cooldown ready",
+        }
+    }
+}
+
+impl TriggerSettingsSet {
+    fn get(&self, kind: TriggerKind) -> &TriggerSettings {
+        match kind {
+            TriggerKind::Death => &self.death,
+            TriggerKind::AbilityUse => &self.ability_use.trigger,
+            TriggerKind::AbilityCooldownReady => &self.ability_cooldown_ready.trigger,
+        }
+    }
+
+    fn get_mut(&mut self, kind: TriggerKind) -> &mut TriggerSettings {
+        match kind {
+            TriggerKind::Death => &mut self.death,
+            TriggerKind::AbilityUse => &mut self.ability_use.trigger,
+            TriggerKind::AbilityCooldownReady => &mut self.ability_cooldown_ready.trigger,
+        }
+    }
+
+    fn ability_filter(&self, kind: TriggerKind) -> Option<&AbilityFilter> {
+        match kind {
+            TriggerKind::Death => None,
+            TriggerKind::AbilityUse => Some(&self.ability_use.ability_filter),
+            TriggerKind::AbilityCooldownReady => Some(&self.ability_cooldown_ready.ability_filter),
+        }
+    }
+
+    fn ability_filter_mut(&mut self, kind: TriggerKind) -> Option<&mut AbilityFilter> {
+        match kind {
+            TriggerKind::Death => None,
+            TriggerKind::AbilityUse => Some(&mut self.ability_use.ability_filter),
+            TriggerKind::AbilityCooldownReady => {
+                Some(&mut self.ability_cooldown_ready.ability_filter)
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum AppSection {
+    #[default]
+    Setup,
+    Effects,
+    GameConnection,
+}
+
+impl AppSection {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Setup => "Setup",
+            Self::Effects => "Effects",
+            Self::GameConnection => "Game connection",
         }
     }
 }
@@ -351,17 +563,8 @@ pub struct AppState {
     pub devices: Vec<ProviderTarget>,
     pub selected_device: Option<TargetId>,
     pub preferred_target: Option<TargetId>,
-    pub shock_mode: ShockMode,
-    pub min_intensity: f32,
-    pub max_intensity: f32,
-    pub intensity: f32,
-    pub min_duration: f32,
-    pub max_duration: f32,
-    pub duration: f32,
+    pub triggers: TriggerSettingsSet,
     pub log_path: String,
-    pub death_trigger_enabled: bool,
-    pub ability_use_trigger_enabled: bool,
-    pub ability_cooldown_ready_trigger_enabled: bool,
     client: Option<Arc<ConnectedProvider>>,
     connection_error: Option<String>,
     connection_result: Option<Receiver<ConnectionResult>>,
@@ -376,7 +579,12 @@ pub struct AppState {
     bridge_events: Option<Receiver<BridgeEvent>>,
     last_bridge_event: Option<BridgeEvent>,
     last_sequence: Option<(String, u64)>,
+    ability_catalog: BTreeMap<u32, Option<String>>,
     listener_action_error: Option<String>,
+    selected_section: AppSection,
+    selected_effect: TriggerKind,
+    copy_source: TriggerKind,
+    copy_feedback: Option<String>,
 }
 
 impl Default for AppState {
@@ -391,17 +599,8 @@ impl Default for AppState {
             devices: Vec::new(),
             selected_device: None,
             preferred_target: None,
-            shock_mode: ShockMode::default(),
-            min_intensity: MIN_SHOCK_INTENSITY,
-            max_intensity: MIN_SHOCK_INTENSITY,
-            intensity: MIN_SHOCK_INTENSITY,
-            min_duration: MIN_SHOCK_DURATION,
-            max_duration: MIN_SHOCK_DURATION,
-            duration: MIN_SHOCK_DURATION,
+            triggers: TriggerSettingsSet::default(),
             log_path: String::new(),
-            death_trigger_enabled: true,
-            ability_use_trigger_enabled: false,
-            ability_cooldown_ready_trigger_enabled: false,
             client: None,
             connection_error: None,
             connection_result: None,
@@ -416,7 +615,12 @@ impl Default for AppState {
             bridge_events: None,
             last_bridge_event: None,
             last_sequence: None,
+            ability_catalog: BTreeMap::new(),
             listener_action_error: None,
+            selected_section: AppSection::default(),
+            selected_effect: TriggerKind::Death,
+            copy_source: TriggerKind::AbilityUse,
+            copy_feedback: None,
         }
     }
 }
@@ -465,24 +669,16 @@ impl AppState {
         self.username.clear();
         self.api_key.clear();
         self.openshock_token.clear();
-        self.preferred_target = None;
-        self.shock_mode = ShockMode::default();
-        self.min_intensity = MIN_SHOCK_INTENSITY;
-        self.max_intensity = MIN_SHOCK_INTENSITY;
-        self.intensity = MIN_SHOCK_INTENSITY;
-        self.min_duration = MIN_SHOCK_DURATION;
-        self.max_duration = MIN_SHOCK_DURATION;
-        self.duration = MIN_SHOCK_DURATION;
+        self.triggers = TriggerSettingsSet::default();
         self.log_path.clear();
-        self.death_trigger_enabled = true;
-        self.ability_use_trigger_enabled = false;
-        self.ability_cooldown_ready_trigger_enabled = false;
         self.log_detection_status = None;
         self.bridge_listener = ConsoleLogListener::default();
         self.bridge_events = None;
         self.last_bridge_event = None;
         self.last_sequence = None;
+        self.ability_catalog.clear();
         self.listener_action_error = None;
+        self.copy_feedback = None;
         self.shock_status = None;
         self.shock_in_flight = 0;
         let (shock_sender, shock_result) = spawn_shock_worker();
@@ -500,6 +696,7 @@ impl AppState {
         self.bridge_events.is_none()
             && self.last_bridge_event.is_none()
             && self.last_sequence.is_none()
+            && self.ability_catalog.is_empty()
             && self.shock_status.is_none()
             && self.shock_in_flight == 0
     }
@@ -723,37 +920,34 @@ impl AppState {
     fn apply_sound_error(&mut self, error: ProviderError) {
         self.sound_status = Some(SoundStatus::Failed(format!("Test sound failed: {error}")));
     }
-    pub fn resolve_shock(&self) -> Option<ResolvedShock> {
-        let mut rng = rand::rng();
-        self.resolve_shock_with(&mut rng)
+    fn copy_shock_settings(&mut self, source: TriggerKind, destination: TriggerKind) -> bool {
+        if source == destination {
+            return false;
+        }
+        let shock = self.triggers.get(source).shock.clone();
+        self.triggers.get_mut(destination).shock = shock;
+        self.copy_feedback = Some(format!(
+            "Copied {} shock settings to {}.",
+            source.label(),
+            destination.label()
+        ));
+        true
     }
-    fn resolve_shock_with<R: Rng + ?Sized>(&self, rng: &mut R) -> Option<ResolvedShock> {
-        let intensity = match self.shock_mode {
-            ShockMode::Fixed => portable_intensity(self.intensity)?,
-            ShockMode::Interval => {
-                let min = portable_intensity(self.min_intensity)?;
-                let max = portable_intensity(self.max_intensity)?;
-                if min > max {
-                    return None;
-                }
-                rng.random_range(min..=max)
-            }
-        };
-        let duration_ms = match self.shock_mode {
-            ShockMode::Fixed => portable_duration(self.duration)?,
-            ShockMode::Interval => {
-                let min = portable_duration(self.min_duration)?;
-                let max = portable_duration(self.max_duration)?;
-                if min > max {
-                    return None;
-                }
-                rng.random_range(min..=max)
-            }
-        };
-        Some(ResolvedShock {
-            intensity,
-            duration_ms,
-        })
+    fn select_effect(&mut self, kind: TriggerKind) {
+        self.selected_effect = kind;
+        if self.copy_source == kind {
+            self.copy_source = first_copy_source(kind);
+        }
+        self.copy_feedback = None;
+    }
+
+    fn replace_ability_catalog(&mut self, catalog: crate::bridge_listener::AbilityCatalog) {
+        self.ability_catalog = catalog
+            .abilities
+            .into_iter()
+            .filter(|ability| ability.ability_slot > 0)
+            .map(|ability| (ability.ability_slot, ability.ability_name))
+            .collect();
     }
     fn poll_shock(&mut self) {
         loop {
@@ -846,14 +1040,6 @@ impl AppState {
         true
     }
 
-    fn trigger_enabled(&self, kind: TriggerKind) -> bool {
-        match kind {
-            TriggerKind::Death => self.death_trigger_enabled,
-            TriggerKind::AbilityUse => self.ability_use_trigger_enabled,
-            TriggerKind::AbilityCooldownReady => self.ability_cooldown_ready_trigger_enabled,
-        }
-    }
-
     fn apply_shock_enqueue_result(&mut self, request: ShockRequest, result: ShockEnqueueResult) {
         let trigger = &request.trigger;
         match result {
@@ -913,7 +1099,8 @@ impl AppState {
         if !self.trigger_is_new(&trigger) {
             return;
         }
-        if !self.trigger_enabled(trigger.kind) {
+        let settings = self.triggers.get(trigger.kind);
+        if !settings.enabled {
             log::info!(
                 target: "companion::app",
                 "trigger_disabled trigger={} session_id={:?} sequence={} ability_slot={:?} detection={:?}",
@@ -925,10 +1112,27 @@ impl AppState {
             );
             return;
         }
+        if let (Some(filter), Some(ability_slot)) = (
+            self.triggers.ability_filter(trigger.kind),
+            trigger.ability_slot,
+        ) && !filter.accepts(ability_slot)
+        {
+            log::info!(
+                target: "companion::app",
+                "trigger_filtered reason=ability_not_selected trigger={} session_id={:?} sequence={} ability_slot={} detection={:?}",
+                trigger.kind.label(),
+                trigger.session_id,
+                trigger.sequence,
+                ability_slot,
+                trigger.detection
+            );
+            return;
+        }
+        let resolved = settings.shock.resolve();
         let request = ShockRequest {
             provider: self.provider,
             target: self.selected_device().cloned(),
-            resolved: self.resolve_shock(),
+            resolved,
             trigger,
         };
         let Some(client) = self.client.clone() else {
@@ -1016,6 +1220,13 @@ impl AppState {
                             ready.client_time_ms,
                             ready.poll_interval_ms
                         ),
+                        BridgeEvent::AbilityCatalog(catalog) => log::info!(
+                            target: "companion::app",
+                            "bridge_ability_catalog session_id={:?} client_time_ms={} abilities={}",
+                            catalog.session_id,
+                            catalog.client_time_ms,
+                            catalog.abilities.len()
+                        ),
                         BridgeEvent::LocalPlayerDeath(death) => log::info!(
                             target: "companion::app",
                             "bridge_trigger_received trigger=death session_id={:?} sequence={} client_time_ms={} detection={:?}",
@@ -1049,7 +1260,14 @@ impl AppState {
                     }
                     self.last_bridge_event = Some(event.clone());
                     let trigger = match event {
-                        BridgeEvent::HookReady(_) => None,
+                        BridgeEvent::HookReady(_) => {
+                            self.ability_catalog.clear();
+                            None
+                        }
+                        BridgeEvent::AbilityCatalog(catalog) => {
+                            self.replace_ability_catalog(catalog);
+                            None
+                        }
                         BridgeEvent::LocalPlayerDeath(death) => {
                             Some(TriggerIdentity::from_death(death))
                         }
@@ -1184,6 +1402,32 @@ impl AppState {
         self.poll_shock();
         self.poll_bridge_events();
         let busy = self.is_busy();
+
+        ui.horizontal_wrapped(|ui| {
+            for section in [
+                AppSection::Setup,
+                AppSection::Effects,
+                AppSection::GameConnection,
+            ] {
+                ui.selectable_value(&mut self.selected_section, section, section.label());
+            }
+        });
+        ui.separator();
+        ui.add_space(6.0);
+
+        match self.selected_section {
+            AppSection::Setup => self.draw_setup(ui, busy),
+            AppSection::Effects => self.draw_effects(ui, busy),
+            AppSection::GameConnection => self.draw_game_connection(ui),
+        }
+
+        let listener_status = self.bridge_listener.status();
+        if listener_status.phase != ListenerPhase::Stopped || self.shock_in_progress() {
+            ui.ctx().request_repaint_after(Duration::from_millis(250));
+        }
+    }
+
+    fn draw_setup(&mut self, ui: &mut Ui, busy: bool) {
         ui.heading("Provider");
         let mut provider = self.provider;
         ui.add_enabled_ui(!busy, |ui| {
@@ -1197,7 +1441,8 @@ impl AppState {
         if provider != self.provider {
             self.set_provider(provider);
         }
-        ui.add_space(4.0);
+
+        ui.add_space(8.0);
         ui.heading("Credentials");
         let mut credentials_changed = false;
         ui.add_enabled_ui(!busy, |ui| match self.provider {
@@ -1236,14 +1481,12 @@ impl AppState {
         if let Some(error) = &self.connection_error {
             status_line(ui, error, CredentialState::Invalid.color());
         }
+
         ui.add_space(8.0);
         ui.separator();
         ui.add_space(8.0);
         ui.heading("Device group");
-        let selection_enabled = !self.devices.is_empty()
-            && !self.connection_in_progress()
-            && !self.sound_in_progress()
-            && !self.shock_in_progress();
+        let selection_enabled = !self.devices.is_empty() && !busy;
         let selected_name = self
             .selected_device()
             .map(|device| device.name().to_owned())
@@ -1288,115 +1531,189 @@ impl AppState {
         if let Some(status) = &self.sound_status {
             status_line(ui, status.label(), status.color());
         }
-        if let Some(status) = &self.shock_status {
-            let label = status.label();
-            status_line(ui, &label, status.color());
+    }
+
+    fn draw_effects(&mut self, ui: &mut Ui, busy: bool) {
+        ui.heading("Effects");
+        ui.label("Each trigger has its own shock settings.");
+        ui.add_space(4.0);
+        for kind in [
+            TriggerKind::Death,
+            TriggerKind::AbilityUse,
+            TriggerKind::AbilityCooldownReady,
+        ] {
+            let summary = self.triggers.get(kind).shock.summary();
+            let selected = self.selected_effect == kind;
+            let frame = egui::Frame::group(ui.style()).inner_margin(8.0);
+            let frame = if selected {
+                frame
+                    .fill(ui.visuals().selection.bg_fill.gamma_multiply(0.35))
+                    .stroke(ui.visuals().selection.stroke)
+            } else {
+                frame
+            };
+            let mut configure_clicked = false;
+            frame.show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.strong(trigger_display_label(kind));
+                        ui.small(summary);
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        configure_clicked |= ui.button("⚙ Configure").clicked();
+                        ui.add_enabled_ui(!busy, |ui| {
+                            toggle_button(ui, &mut self.triggers.get_mut(kind).enabled);
+                        });
+                    });
+                });
+            });
+            if configure_clicked {
+                self.select_effect(kind);
+            }
+            ui.add_space(4.0);
         }
+
         ui.add_space(8.0);
         ui.separator();
         ui.add_space(8.0);
-        ui.heading("Triggers");
-        ui.checkbox(&mut self.death_trigger_enabled, "Local-player death");
-        ui.checkbox(&mut self.ability_use_trigger_enabled, "Ability used");
-        ui.checkbox(
-            &mut self.ability_cooldown_ready_trigger_enabled,
-            "Ability cooldown ready",
-        );
-        ui.label(
-            "Ability triggers are opt-in. Every enabled trigger uses the shock settings below.",
-        );
-        ui.add_space(8.0);
-        ui.separator();
-        ui.add_space(8.0);
+        let destination = self.selected_effect;
+        ui.heading(format!("{} effect", trigger_display_label(destination)));
         ui.add_enabled_ui(!busy, |ui| {
-            ui.heading("Shock mode");
             ui.horizontal(|ui| {
-                ui.label("Mode");
-                egui::ComboBox::from_id_salt("shock-mode")
-                    .selected_text(self.shock_mode.label())
+                ui.label("Trigger");
+                toggle_button(ui, &mut self.triggers.get_mut(destination).enabled);
+            });
+        });
+
+        if destination != TriggerKind::Death {
+            self.draw_ability_filter(ui, destination, busy);
+            if destination == TriggerKind::AbilityCooldownReady {
+                ui.small(
+                    "Cooldown ready includes a normal cooldown finishing and a charged ability restoring a charge.",
+                );
+            }
+        }
+
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.label("Copy shock settings from");
+            ui.add_enabled_ui(!busy, |ui| {
+                egui::ComboBox::from_id_salt("copy-shock-source")
+                    .selected_text(trigger_display_label(self.copy_source))
                     .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.shock_mode, ShockMode::Interval, "Interval");
-                        ui.selectable_value(&mut self.shock_mode, ShockMode::Fixed, "Fixed");
+                        for source in [
+                            TriggerKind::Death,
+                            TriggerKind::AbilityUse,
+                            TriggerKind::AbilityCooldownReady,
+                        ] {
+                            if source != destination {
+                                ui.selectable_value(
+                                    &mut self.copy_source,
+                                    source,
+                                    trigger_display_label(source),
+                                );
+                            }
+                        }
                     });
             });
-            ui.add_space(4.0);
-            match self.shock_mode {
-                ShockMode::Interval => {
-                    slider_input(
-                        ui,
-                        "Minimum intensity",
-                        &mut self.min_intensity,
-                        MIN_SHOCK_INTENSITY..=MAX_SHOCK_INTENSITY,
-                        1.0,
-                        "%",
-                    );
-                    slider_input(
-                        ui,
-                        "Maximum intensity",
-                        &mut self.max_intensity,
-                        MIN_SHOCK_INTENSITY..=MAX_SHOCK_INTENSITY,
-                        1.0,
-                        "%",
-                    );
-                    slider_input(
-                        ui,
-                        "Minimum duration",
-                        &mut self.min_duration,
-                        MIN_SHOCK_DURATION..=MAX_SHOCK_DURATION,
-                        0.1,
-                        " s",
-                    );
-                    slider_input(
-                        ui,
-                        "Maximum duration",
-                        &mut self.max_duration,
-                        MIN_SHOCK_DURATION..=MAX_SHOCK_DURATION,
-                        0.1,
-                        " s",
-                    );
-                }
-                ShockMode::Fixed => {
-                    slider_input(
-                        ui,
-                        "Intensity",
-                        &mut self.intensity,
-                        MIN_SHOCK_INTENSITY..=MAX_SHOCK_INTENSITY,
-                        1.0,
-                        "%",
-                    );
-                    slider_input(
-                        ui,
-                        "Duration",
-                        &mut self.duration,
-                        MIN_SHOCK_DURATION..=MAX_SHOCK_DURATION,
-                        0.1,
-                        " s",
-                    );
-                }
-            }
         });
-        if self.min_intensity > self.max_intensity {
-            self.max_intensity = self.min_intensity;
+        if ui
+            .add_enabled(
+                !busy && self.copy_source != destination,
+                egui::Button::new("Copy").min_size([ui.available_width(), 0.0].into()),
+            )
+            .clicked()
+        {
+            self.copy_shock_settings(self.copy_source, destination);
         }
-        if self.min_duration > self.max_duration {
-            self.max_duration = self.min_duration;
+        if let Some(feedback) = &self.copy_feedback {
+            status_line(ui, feedback, [0.30, 0.78, 0.42, 1.0]);
         }
+
+        ui.add_space(6.0);
+        ui.add_enabled_ui(!busy, |ui| {
+            draw_shock_settings_editor(ui, &mut self.triggers.get_mut(destination).shock);
+        });
+    }
+
+    fn draw_ability_filter(&mut self, ui: &mut Ui, kind: TriggerKind, busy: bool) {
+        let slots = (1..=4)
+            .chain(self.ability_catalog.keys().copied())
+            .collect::<BTreeSet<_>>();
+        let names = &self.ability_catalog;
+        let filter = self
+            .triggers
+            .ability_filter_mut(kind)
+            .expect("ability trigger has an ability filter");
+
+        ui.add_space(6.0);
+        ui.label("Abilities");
+        ui.add_enabled_ui(!busy, |ui| {
+            ui.horizontal(|ui| {
+                if ui.button("All").clicked() {
+                    *filter = AbilityFilter::All;
+                }
+                if ui.button("None").clicked() {
+                    *filter = AbilityFilter::Selected(BTreeSet::new());
+                }
+            });
+            ui.horizontal_wrapped(|ui| {
+                for slot in &slots {
+                    let mut selected = filter.accepts(*slot);
+                    let label = names
+                        .get(slot)
+                        .and_then(Option::as_deref)
+                        .map(|name| format!("Slot {slot} — {name}"))
+                        .unwrap_or_else(|| format!("Slot {slot}"));
+                    if ui.checkbox(&mut selected, label).changed() {
+                        if matches!(&*filter, AbilityFilter::All) {
+                            let selected_slots = slots
+                                .iter()
+                                .copied()
+                                .filter(|candidate| *candidate != *slot)
+                                .collect();
+                            *filter = AbilityFilter::Selected(selected_slots);
+                        } else if let AbilityFilter::Selected(selected_slots) = &mut *filter {
+                            if selected {
+                                selected_slots.insert(*slot);
+                            } else {
+                                selected_slots.remove(slot);
+                            }
+                        }
+                    }
+                }
+            });
+        });
+        if matches!(&*filter, AbilityFilter::Selected(slots) if slots.is_empty()) {
+            status_line(
+                ui,
+                "No abilities are selected; this trigger will not shock.",
+                [0.92, 0.68, 0.22, 1.0],
+            );
+        }
+        if self.ability_catalog.is_empty() {
+            ui.small("Using numbered slots until the game reports ability names.");
+        }
+    }
+
+    fn draw_game_connection(&mut self, ui: &mut Ui) {
+        ui.heading("Game connection");
+        ui.label("Deadlock must be launched with -condebug so it writes console.log.");
         text_input(ui, "Log path", &mut self.log_path, false);
         ui.horizontal(|ui| {
+            let spacing = ui.spacing().item_spacing.x;
+            let button_size = egui::vec2(
+                (ui.available_width() - spacing) * 0.5,
+                ui.spacing().interact_size.y,
+            );
             if ui
-                .add_sized(
-                    [ui.available_width() * 0.5, 0.0],
-                    egui::Button::new("Auto-detect"),
-                )
+                .add_sized(button_size, egui::Button::new("Auto-detect"))
                 .clicked()
             {
                 self.auto_detect_log_path();
             }
             if ui
-                .add_sized(
-                    [ui.available_width(), 0.0],
-                    egui::Button::new("Start/Restart listener"),
-                )
+                .add_sized(button_size, egui::Button::new("Start/Restart listener"))
                 .clicked()
             {
                 self.start_listener_from_input();
@@ -1410,8 +1727,15 @@ impl AppState {
         }
         let listener_status = self.bridge_listener.status();
         draw_listener_status(ui, &listener_status, self.last_bridge_event.as_ref());
-        if listener_status.phase != ListenerPhase::Stopped || self.shock_in_progress() {
-            ui.ctx().request_repaint_after(Duration::from_millis(250));
+        ui.label(format!(
+            "Current ability catalogue: {} slot(s).",
+            self.ability_catalog.len()
+        ));
+        if let Some(status) = &self.shock_status {
+            let label = status.label();
+            status_line(ui, &label, status.color());
+        } else {
+            ui.label("Last shock delivery: none since startup.");
         }
     }
 }
@@ -1583,6 +1907,109 @@ impl CompanionApp {
         true
     }
 }
+fn trigger_display_label(kind: TriggerKind) -> &'static str {
+    match kind {
+        TriggerKind::Death => "Death",
+        TriggerKind::AbilityUse => "Ability use",
+        TriggerKind::AbilityCooldownReady => "Cooldown ready",
+    }
+}
+
+fn first_copy_source(destination: TriggerKind) -> TriggerKind {
+    match destination {
+        TriggerKind::Death => TriggerKind::AbilityUse,
+        TriggerKind::AbilityUse | TriggerKind::AbilityCooldownReady => TriggerKind::Death,
+    }
+}
+
+fn toggle_button(ui: &mut Ui, value: &mut bool) {
+    let label = if *value { "On" } else { "Off" };
+    if ui
+        .add(
+            egui::Button::new(label)
+                .selected(*value)
+                .min_size(egui::vec2(44.0, 0.0)),
+        )
+        .clicked()
+    {
+        *value = !*value;
+    }
+}
+
+fn draw_shock_settings_editor(ui: &mut Ui, shock: &mut ShockSettings) {
+    ui.heading("Shock mode");
+    ui.horizontal(|ui| {
+        ui.label("Mode");
+        egui::ComboBox::from_id_salt("shock-mode")
+            .selected_text(shock.mode.label())
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut shock.mode, ShockMode::Interval, "Interval");
+                ui.selectable_value(&mut shock.mode, ShockMode::Fixed, "Fixed");
+            });
+    });
+    ui.add_space(4.0);
+    match shock.mode {
+        ShockMode::Interval => {
+            slider_input(
+                ui,
+                "Minimum intensity",
+                &mut shock.interval.minimum_intensity,
+                MIN_SHOCK_INTENSITY..=MAX_SHOCK_INTENSITY,
+                1.0,
+                "%",
+            );
+            slider_input(
+                ui,
+                "Maximum intensity",
+                &mut shock.interval.maximum_intensity,
+                MIN_SHOCK_INTENSITY..=MAX_SHOCK_INTENSITY,
+                1.0,
+                "%",
+            );
+            slider_input(
+                ui,
+                "Minimum duration",
+                &mut shock.interval.minimum_duration_seconds,
+                MIN_SHOCK_DURATION..=MAX_SHOCK_DURATION,
+                0.1,
+                " s",
+            );
+            slider_input(
+                ui,
+                "Maximum duration",
+                &mut shock.interval.maximum_duration_seconds,
+                MIN_SHOCK_DURATION..=MAX_SHOCK_DURATION,
+                0.1,
+                " s",
+            );
+        }
+        ShockMode::Fixed => {
+            slider_input(
+                ui,
+                "Intensity",
+                &mut shock.fixed.intensity,
+                MIN_SHOCK_INTENSITY..=MAX_SHOCK_INTENSITY,
+                1.0,
+                "%",
+            );
+            slider_input(
+                ui,
+                "Duration",
+                &mut shock.fixed.duration_seconds,
+                MIN_SHOCK_DURATION..=MAX_SHOCK_DURATION,
+                0.1,
+                " s",
+            );
+        }
+    }
+    if shock.interval.minimum_intensity > shock.interval.maximum_intensity {
+        shock.interval.maximum_intensity = shock.interval.minimum_intensity;
+    }
+    if shock.interval.minimum_duration_seconds > shock.interval.maximum_duration_seconds {
+        shock.interval.maximum_duration_seconds = shock.interval.minimum_duration_seconds;
+    }
+}
+
 fn portable_intensity(value: f32) -> Option<u8> {
     (value.is_finite()
         && value.fract() == 0.0
@@ -1653,6 +2080,9 @@ fn bridge_event_description(event: &BridgeEvent) -> String {
         BridgeEvent::HookReady(_) | BridgeEvent::LocalPlayerDeath(_) => {
             event.event_name().to_owned()
         }
+        BridgeEvent::AbilityCatalog(catalog) => {
+            format!("ability_catalog, {} slot(s)", catalog.abilities.len())
+        }
         BridgeEvent::AbilityUsed(ability) => ability_description("ability_used", ability),
         BridgeEvent::AbilityCooldownReady(ability) => {
             ability_description("ability_cooldown_ready", ability)
@@ -1712,6 +2142,8 @@ fn to_color(color: [f32; 4]) -> Color32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::SeedableRng;
+    use rand::rngs::StdRng;
     #[test]
     fn credentials_require_provider_specific_values() {
         let mut state = AppState::default();
@@ -1798,17 +2230,28 @@ mod tests {
         assert!(matches!(state.sound_status, Some(SoundStatus::Failed(_))));
     }
     #[test]
-    fn both_shock_modes_render_draw_data() {
-        for mode in [ShockMode::Interval, ShockMode::Fixed] {
-            let context = egui::Context::default();
-            let mut state = AppState {
-                shock_mode: mode,
-                ..AppState::default()
-            };
-            let output = context.run_ui(egui::RawInput::default(), |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| state.draw(ui));
-            });
-            assert!(!output.shapes.is_empty());
+    fn all_effect_editors_render_both_shock_modes() {
+        for kind in [
+            TriggerKind::Death,
+            TriggerKind::AbilityUse,
+            TriggerKind::AbilityCooldownReady,
+        ] {
+            for mode in [ShockMode::Interval, ShockMode::Fixed] {
+                let context = egui::Context::default();
+                let mut state = AppState::default();
+                state.selected_section = AppSection::Effects;
+                state.selected_effect = kind;
+                state.triggers.get_mut(kind).shock.mode = mode;
+                if kind != TriggerKind::Death {
+                    state
+                        .ability_catalog
+                        .insert(1, Some("Power Slash".to_owned()));
+                }
+                let output = context.run_ui(egui::RawInput::default(), |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| state.draw(ui));
+                });
+                assert!(!output.shapes.is_empty());
+            }
         }
     }
     #[test]
@@ -1868,46 +2311,90 @@ mod tests {
         }
     }
     #[test]
-    fn shock_settings_use_portable_bounds_and_fixed_values() {
-        let state = AppState {
-            shock_mode: ShockMode::Fixed,
-            intensity: 37.0,
-            duration: 1.234,
-            ..AppState::default()
-        };
+    fn shock_profiles_resolve_portable_fixed_and_interval_values_independently() {
+        let mut fixed = ShockSettings::default();
+        fixed.mode = ShockMode::Fixed;
+        fixed.fixed.intensity = 37.0;
+        fixed.fixed.duration_seconds = 1.234;
         assert_eq!(
-            state.resolve_shock(),
+            fixed.resolve(),
             Some(ResolvedShock {
                 intensity: 37,
                 duration_ms: 1_234
             })
         );
-        let interval = AppState::default();
+
+        let mut interval = ShockSettings::default();
+        interval.interval.minimum_intensity = 70.0;
+        interval.interval.maximum_intensity = 72.0;
+        interval.interval.minimum_duration_seconds = 2.5;
+        interval.interval.maximum_duration_seconds = 2.6;
+        let mut rng = StdRng::seed_from_u64(7);
+        let resolved = interval.resolve_with(&mut rng).unwrap();
+        assert!((70..=72).contains(&resolved.intensity));
+        assert!((2_500..=2_600).contains(&resolved.duration_ms));
+        assert_eq!(ShockSettings::default().resolve().unwrap().intensity, 1);
+
+        fixed.fixed.intensity = 0.0;
+        assert_eq!(fixed.resolve(), None);
+        interval.interval.minimum_intensity = 90.0;
+        interval.interval.maximum_intensity = 10.0;
+        assert_eq!(interval.resolve(), None);
+    }
+
+    #[test]
+    fn ability_filters_cover_all_selected_empty_and_unknown_slots() {
+        assert!(AbilityFilter::All.accepts(1));
+        assert!(AbilityFilter::All.accepts(999));
+        let selected = AbilityFilter::Selected(BTreeSet::from([2, 5]));
+        assert!(!selected.accepts(1));
+        assert!(selected.accepts(2));
+        assert!(selected.accepts(5));
+        assert!(!selected.accepts(999));
+        assert!(!AbilityFilter::Selected(BTreeSet::new()).accepts(2));
+    }
+
+    #[test]
+    fn copy_transfers_both_shock_banks_without_enabled_state_or_filter() {
+        let mut state = AppState::default();
+        state.triggers.death.enabled = false;
+        state.triggers.death.shock.mode = ShockMode::Fixed;
+        state.triggers.death.shock.fixed.intensity = 61.0;
+        state.triggers.death.shock.fixed.duration_seconds = 1.7;
+        state.triggers.death.shock.interval.minimum_intensity = 11.0;
+        state.triggers.death.shock.interval.maximum_intensity = 89.0;
+        state.triggers.death.shock.interval.minimum_duration_seconds = 0.6;
+        state.triggers.death.shock.interval.maximum_duration_seconds = 2.8;
+        state.triggers.ability_use.trigger.enabled = true;
+        state.triggers.ability_use.ability_filter = AbilityFilter::Selected(BTreeSet::from([2]));
+
+        assert!(state.copy_shock_settings(TriggerKind::Death, TriggerKind::AbilityUse));
         assert_eq!(
-            interval.resolve_shock(),
-            Some(ResolvedShock {
-                intensity: 1,
-                duration_ms: 300
-            })
+            state.triggers.ability_use.trigger.shock,
+            state.triggers.death.shock
         );
+        assert!(state.triggers.ability_use.trigger.enabled);
         assert_eq!(
-            (AppState {
-                shock_mode: ShockMode::Fixed,
-                intensity: 0.0,
-                ..AppState::default()
-            })
-            .resolve_shock(),
-            None
+            state.triggers.ability_use.ability_filter,
+            AbilityFilter::Selected(BTreeSet::from([2]))
         );
-        assert_eq!(
-            (AppState {
-                min_intensity: 90.0,
-                max_intensity: 10.0,
-                ..AppState::default()
-            })
-            .resolve_shock(),
-            None
-        );
+        assert!(!state.copy_shock_settings(TriggerKind::Death, TriggerKind::Death));
+    }
+
+    #[test]
+    fn selecting_an_effect_updates_the_editor_and_copy_source() {
+        let mut state = AppState {
+            selected_effect: TriggerKind::Death,
+            copy_source: TriggerKind::AbilityUse,
+            copy_feedback: Some("old confirmation".to_owned()),
+            ..AppState::default()
+        };
+
+        state.select_effect(TriggerKind::AbilityUse);
+
+        assert_eq!(state.selected_effect, TriggerKind::AbilityUse);
+        assert_eq!(state.copy_source, TriggerKind::Death);
+        assert!(state.copy_feedback.is_none());
     }
     #[test]
     fn shock_queue_accepts_capacity_without_blocking() {
@@ -2010,7 +2497,7 @@ mod tests {
         let first = state.shock_status.clone();
         assert!(matches!(&first, Some(ShockStatus::Skipped { .. })));
 
-        state.ability_use_trigger_enabled = true;
+        state.triggers.ability_use.trigger.enabled = true;
         state.queue_trigger_shock(trigger(TriggerKind::AbilityUse, "first", 5));
         assert_eq!(state.shock_status, first);
         state.queue_trigger_shock(trigger(TriggerKind::AbilityUse, "first", 6));
@@ -2023,15 +2510,15 @@ mod tests {
     #[test]
     fn trigger_defaults_and_cooldown_enablement_control_queueing() {
         let mut state = AppState::default();
-        assert!(state.death_trigger_enabled);
-        assert!(!state.ability_use_trigger_enabled);
-        assert!(!state.ability_cooldown_ready_trigger_enabled);
+        assert!(state.triggers.death.enabled);
+        assert!(!state.triggers.ability_use.trigger.enabled);
+        assert!(!state.triggers.ability_cooldown_ready.trigger.enabled);
 
         state.queue_trigger_shock(trigger(TriggerKind::AbilityCooldownReady, "session", 1));
         assert_eq!(state.last_sequence, Some(("session".to_owned(), 1)));
         assert!(state.shock_status.is_none());
 
-        state.ability_cooldown_ready_trigger_enabled = true;
+        state.triggers.ability_cooldown_ready.trigger.enabled = true;
         state.queue_trigger_shock(trigger(TriggerKind::AbilityCooldownReady, "session", 2));
         assert!(matches!(
             state.shock_status,
@@ -2046,6 +2533,9 @@ mod tests {
             bridge_events: Some(receiver),
             ..AppState::default()
         };
+        state
+            .ability_catalog
+            .insert(1, Some("Stale name".to_owned()));
         sender
             .send(BridgeEvent::HookReady(crate::bridge_listener::HookReady {
                 schema: 1,
@@ -2055,6 +2545,7 @@ mod tests {
             }))
             .unwrap();
         state.poll_bridge_events();
+        assert!(state.ability_catalog.is_empty());
         assert!(state.last_sequence.is_none());
         assert!(state.shock_status.is_none());
     }
@@ -2085,10 +2576,10 @@ mod tests {
         .expect("valid ability event");
         let (sender, receiver) = mpsc::channel();
         let mut state = AppState {
-            ability_cooldown_ready_trigger_enabled: true,
             bridge_events: Some(receiver),
             ..AppState::default()
         };
+        state.triggers.ability_cooldown_ready.trigger.enabled = true;
 
         sender.send(event).unwrap();
         state.poll_bridge_events();
@@ -2099,6 +2590,113 @@ mod tests {
             Some(ShockStatus::Skipped { .. })
         ));
         assert_eq!(state.shock_in_flight, 0);
+    }
+
+    #[test]
+    fn deduplication_advances_before_filtering_and_filters_are_independent() {
+        let mut state = AppState::default();
+        state.triggers.ability_use.trigger.enabled = true;
+        state.triggers.ability_cooldown_ready.trigger.enabled = true;
+        state.triggers.ability_use.ability_filter = AbilityFilter::Selected(BTreeSet::new());
+        state.triggers.ability_cooldown_ready.ability_filter =
+            AbilityFilter::Selected(BTreeSet::from([3]));
+
+        state.queue_trigger_shock(trigger(TriggerKind::AbilityUse, "session", 1));
+        assert_eq!(state.last_sequence, Some(("session".to_owned(), 1)));
+        assert!(state.shock_status.is_none());
+
+        state.triggers.ability_use.ability_filter = AbilityFilter::All;
+        state.queue_trigger_shock(trigger(TriggerKind::AbilityUse, "session", 1));
+        assert!(state.shock_status.is_none());
+        state.queue_trigger_shock(trigger(TriggerKind::AbilityUse, "session", 2));
+        let accepted_use = state.shock_status.clone();
+        assert!(matches!(&accepted_use, Some(ShockStatus::Skipped { .. })));
+
+        state.queue_trigger_shock(trigger(TriggerKind::AbilityCooldownReady, "session", 3));
+        assert_eq!(state.shock_status, accepted_use);
+        assert_eq!(state.last_sequence, Some(("session".to_owned(), 3)));
+    }
+
+    #[test]
+    fn trigger_routing_resolves_the_selected_profile_before_status_is_recorded() {
+        let mut state = AppState::default();
+        state.triggers.death.shock.mode = ShockMode::Fixed;
+        state.triggers.death.shock.fixed.intensity = 19.0;
+        state.triggers.death.shock.fixed.duration_seconds = 0.7;
+        state.triggers.ability_use.trigger.enabled = true;
+        state.triggers.ability_use.trigger.shock.mode = ShockMode::Fixed;
+        state.triggers.ability_use.trigger.shock.fixed.intensity = 73.0;
+        state
+            .triggers
+            .ability_use
+            .trigger
+            .shock
+            .fixed
+            .duration_seconds = 2.1;
+
+        state.queue_trigger_shock(trigger(TriggerKind::AbilityUse, "session", 1));
+        let Some(status) = state.shock_status.clone() else {
+            panic!("enabled trigger should record missing-provider status");
+        };
+        assert_eq!(
+            status.request().resolved,
+            Some(ResolvedShock {
+                intensity: 73,
+                duration_ms: 2_100,
+            })
+        );
+
+        state.triggers.ability_use.trigger.shock.fixed.intensity = 5.0;
+        assert_eq!(status.request().resolved.unwrap().intensity, 73);
+    }
+
+    #[test]
+    fn ability_catalog_replaces_runtime_names_without_advancing_actionable_state() {
+        let (sender, receiver) = mpsc::channel();
+        let mut state = AppState {
+            bridge_events: Some(receiver),
+            ..AppState::default()
+        };
+        sender
+            .send(BridgeEvent::AbilityCatalog(
+                crate::bridge_listener::AbilityCatalog {
+                    schema: 1,
+                    session_id: "session".to_owned(),
+                    client_time_ms: 1,
+                    abilities: vec![
+                        crate::bridge_listener::AbilityCatalogEntry {
+                            ability_slot: 1,
+                            ability_name: Some("First".to_owned()),
+                        },
+                        crate::bridge_listener::AbilityCatalogEntry {
+                            ability_slot: 5,
+                            ability_name: None,
+                        },
+                    ],
+                },
+            ))
+            .unwrap();
+        state.poll_bridge_events();
+        assert_eq!(
+            state.ability_catalog,
+            BTreeMap::from([(1, Some("First".to_owned())), (5, None)])
+        );
+        assert!(state.last_sequence.is_none());
+        assert!(state.shock_status.is_none());
+
+        state.replace_ability_catalog(crate::bridge_listener::AbilityCatalog {
+            schema: 1,
+            session_id: "session".to_owned(),
+            client_time_ms: 2,
+            abilities: vec![crate::bridge_listener::AbilityCatalogEntry {
+                ability_slot: 2,
+                ability_name: Some("Replacement".to_owned()),
+            }],
+        });
+        assert_eq!(
+            state.ability_catalog,
+            BTreeMap::from([(2, Some("Replacement".to_owned()))])
+        );
     }
 
     #[test]
@@ -2170,10 +2768,12 @@ mod tests {
         app.state.provider = ProviderKind::OpenShock;
         app.state.openshock_token = "secret".to_owned();
         app.state.preferred_target = Some(TargetId::OpenShock("group".to_owned()));
-        app.state.shock_mode = ShockMode::Fixed;
-        app.state.intensity = 80.0;
-        app.state.ability_use_trigger_enabled = true;
-        app.state.ability_cooldown_ready_trigger_enabled = true;
+        app.state.triggers.death.shock.mode = ShockMode::Fixed;
+        app.state.triggers.death.shock.fixed.intensity = 80.0;
+        app.state.triggers.ability_use.trigger.enabled = true;
+        app.state.triggers.ability_use.ability_filter =
+            AbilityFilter::Selected(BTreeSet::from([2]));
+        app.state.triggers.ability_cooldown_ready.trigger.enabled = true;
         let log_path = directory.path().join("console.log");
         app.state.log_path = log_path.display().to_string();
         app.state.start_log_listener(log_path).unwrap();

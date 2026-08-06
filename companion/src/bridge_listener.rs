@@ -24,6 +24,20 @@ pub struct HookReady {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AbilityCatalogEntry {
+    pub ability_slot: u32,
+    pub ability_name: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AbilityCatalog {
+    pub schema: u32,
+    pub session_id: String,
+    pub client_time_ms: u64,
+    pub abilities: Vec<AbilityCatalogEntry>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LocalPlayerDeath {
     pub schema: u32,
     pub session_id: String,
@@ -48,6 +62,7 @@ pub struct AbilityTrigger {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BridgeEvent {
     HookReady(HookReady),
+    AbilityCatalog(AbilityCatalog),
     LocalPlayerDeath(LocalPlayerDeath),
     AbilityUsed(AbilityTrigger),
     AbilityCooldownReady(AbilityTrigger),
@@ -57,6 +72,7 @@ impl BridgeEvent {
     pub fn event_name(&self) -> &'static str {
         match self {
             Self::HookReady(_) => "hook_ready",
+            Self::AbilityCatalog(_) => "ability_catalog",
             Self::LocalPlayerDeath(_) => "local_player_death",
             Self::AbilityUsed(_) => "ability_used",
             Self::AbilityCooldownReady(_) => "ability_cooldown_ready",
@@ -73,6 +89,13 @@ enum WireEvent {
         session_id: String,
         client_time_ms: u64,
         poll_interval_ms: u64,
+    },
+    #[serde(rename = "ability_catalog")]
+    AbilityCatalog {
+        schema: u32,
+        session_id: String,
+        client_time_ms: u64,
+        abilities: Vec<WireAbilityCatalogEntry>,
     },
     #[serde(rename = "local_player_death")]
     LocalPlayerDeath {
@@ -108,6 +131,12 @@ enum WireEvent {
     },
 }
 
+#[derive(Deserialize)]
+struct WireAbilityCatalogEntry {
+    ability_slot: u32,
+    ability_name: Option<String>,
+}
+
 pub fn parse_bridge_record(record: &str) -> Option<BridgeEvent> {
     let prefix_at = record.find(BRIDGE_RECORD_PREFIX)?;
     let payload = &record[prefix_at + BRIDGE_RECORD_PREFIX.len()..];
@@ -123,6 +152,23 @@ pub fn parse_bridge_record(record: &str) -> Option<BridgeEvent> {
             session_id,
             client_time_ms,
             poll_interval_ms,
+        })),
+        WireEvent::AbilityCatalog {
+            schema,
+            session_id,
+            client_time_ms,
+            abilities,
+        } if schema == BRIDGE_SCHEMA => Some(BridgeEvent::AbilityCatalog(AbilityCatalog {
+            schema,
+            session_id,
+            client_time_ms,
+            abilities: abilities
+                .into_iter()
+                .map(|ability| AbilityCatalogEntry {
+                    ability_slot: ability.ability_slot,
+                    ability_name: ability.ability_name,
+                })
+                .collect(),
         })),
         WireEvent::LocalPlayerDeath {
             schema,
@@ -834,6 +880,7 @@ mod tests {
     use std::sync::mpsc::TryRecvError;
 
     const READY_RECORD: &str = "[DEADLOCK_DEATH_HOOK]{\"schema\":1,\"event\":\"hook_ready\",\"session_id\":\"abc-1\",\"client_time_ms\":1700000000000,\"poll_interval_ms\":100}";
+    const CATALOG_RECORD: &str = "[DEADLOCK_DEATH_HOOK]{\"schema\":1,\"event\":\"ability_catalog\",\"session_id\":\"abc-1\",\"client_time_ms\":1700000000100,\"abilities\":[{\"ability_slot\":1,\"ability_name\":\"Kinetic Pulse\"},{\"ability_slot\":5}]}";
     const DEATH_RECORD: &str = "[DEADLOCK_DEATH_HOOK]{\"schema\":1,\"event\":\"local_player_death\",\"session_id\":\"abc-1\",\"client_time_ms\":1700000000123,\"sequence\":7,\"detection\":\"top_bar_local_player_dead_class\"}";
     const ABILITY_USED_RECORD: &str = "[DEADLOCK_DEATH_HOOK]{\"schema\":1,\"event\":\"ability_used\",\"session_id\":\"abc-1\",\"client_time_ms\":1700000000200,\"sequence\":8,\"ability_slot\":2,\"ability_name\":\"Kinetic Pulse\",\"detection\":\"charge_decrement\",\"charges_before\":3,\"charges_after\":2}";
     const ABILITY_READY_RECORD: &str = "[DEADLOCK_DEATH_HOOK]{\"schema\":1,\"event\":\"ability_cooldown_ready\",\"session_id\":\"abc-1\",\"client_time_ms\":1700000000300,\"sequence\":9,\"ability_slot\":4,\"detection\":\"cooldown_finished\"}";
@@ -847,6 +894,24 @@ mod tests {
                 session_id: "abc-1".to_owned(),
                 client_time_ms: 1_700_000_000_000,
                 poll_interval_ms: 100,
+            }))
+        );
+        assert_eq!(
+            parse_bridge_record(CATALOG_RECORD),
+            Some(BridgeEvent::AbilityCatalog(AbilityCatalog {
+                schema: 1,
+                session_id: "abc-1".to_owned(),
+                client_time_ms: 1_700_000_000_100,
+                abilities: vec![
+                    AbilityCatalogEntry {
+                        ability_slot: 1,
+                        ability_name: Some("Kinetic Pulse".to_owned()),
+                    },
+                    AbilityCatalogEntry {
+                        ability_slot: 5,
+                        ability_name: None,
+                    },
+                ],
             }))
         );
         assert_eq!(

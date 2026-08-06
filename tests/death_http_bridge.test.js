@@ -212,7 +212,9 @@ function createHarness({
 }
 
 function actionable(harness) {
-    return harness.events().filter((event) => event.event !== "hook_ready");
+    return harness.events().filter((event) =>
+        ["local_player_death", "ability_used", "ability_cooldown_ready"].includes(event.event)
+    );
 }
 
 function chargedClasses(...extra) {
@@ -225,16 +227,69 @@ afterEach(() => {
 });
 
 describe("death_http_bridge", () => {
-    test("emits only the schema-1 diagnostic ready envelope on startup", () => {
+    test("emits ready and the initial meaningful schema-1 ability catalogue", () => {
         const harness = createHarness();
 
-        expect(harness.events()).toEqual([{
-            schema: 1,
-            event: "hook_ready",
-            session_id: expect.any(String),
-            client_time_ms: expect.any(Number),
-            poll_interval_ms: 100,
-        }]);
+        expect(harness.events()).toEqual([
+            {
+                schema: 1,
+                event: "hook_ready",
+                session_id: expect.any(String),
+                client_time_ms: expect.any(Number),
+                poll_interval_ms: 100,
+            },
+            {
+                schema: 1,
+                event: "ability_catalog",
+                session_id: expect.any(String),
+                client_time_ms: expect.any(Number),
+                abilities: [{
+                    ability_slot: 1,
+                    ability_name: "Test Ability",
+                }],
+            },
+        ]);
+        expect(harness.events("ability_catalog")[0]).not.toHaveProperty("sequence");
+    });
+
+    test("ability catalogue keeps names optional", () => {
+        const harness = createHarness({ ability: { name: null } });
+
+        expect(harness.events("ability_catalog")[0].abilities).toEqual([
+            { ability_slot: 1 },
+        ]);
+    });
+
+    test("refreshes the catalogue after hero, panel, identity, and name replacement", () => {
+        const harness = createHarness();
+        harness.setHeroIdentity("hero_b");
+        harness.runNextPoll();
+        harness.setAbilityState({ identity: "ability_replaced" });
+        harness.runNextPoll();
+        harness.replaceAbilityPanel({ identity: "ability_other", name: "Other Ability" });
+        harness.runNextPoll();
+        harness.setAbilityState({ name: "Renamed Ability" });
+        harness.runNextPoll();
+
+        expect(harness.events("ability_catalog").map((event) => event.abilities)).toEqual([
+            [{ ability_slot: 1, ability_name: "Test Ability" }],
+            [{ ability_slot: 1, ability_name: "Test Ability" }],
+            [{ ability_slot: 1, ability_name: "Test Ability" }],
+            [{ ability_slot: 1, ability_name: "Other Ability" }],
+            [{ ability_slot: 1, ability_name: "Renamed Ability" }],
+        ]);
+    });
+
+    test("ordinary and repeated dead polling do not spam the ability catalogue", () => {
+        const harness = createHarness();
+        harness.runNextPoll();
+        harness.runNextPoll();
+        harness.setDead(true);
+        harness.runNextPoll();
+        harness.runNextPoll();
+        harness.runNextPoll();
+
+        expect(harness.events("ability_catalog")).toHaveLength(1);
     });
 
     test("uses one global sequence for interleaved ability and death events", () => {

@@ -32,9 +32,13 @@ That puts the addon at `dist/deadlock_death_hook.vpk`. Install and enable it in 
 cargo run --manifest-path companion/Cargo.toml --release
 ```
 
-Pick PiShock or OpenShock, enter your credentials, choose a device group, and try the test sound. Choose which triggers to enable, set the intensity and duration you want, then auto-detect `console.log` and start the listener. Local-player death remains enabled by default; ability-use and cooldown-ready triggers are opt-in.
+In **Setup**, pick PiShock or OpenShock, enter your credentials, test the connection, select a device group, and try the test sound.
 
-The companion remembers your setup—including credentials—in your OS user config directory.
+In **Effects**, configure Death, Ability use, and Cooldown ready independently. Each trigger has its own fixed or random-interval shock profile. Ability-use and cooldown-ready also have independent positional-slot filters that apply across heroes; ability names appear when the addon reports them, with numbered slots as the fallback. Use the explicit Copy control to copy only shock settings between profiles without changing enablement or ability selection. Local-player death is enabled by default, while both ability triggers are opt-in. Cooldown ready covers both a normal cooldown finishing and a charged ability restoring a charge.
+
+In **Game connection**, auto-detect `console.log` or enter its path, start the listener, and review listener, bridge-event, and delivery diagnostics. Deadlock must run with `-condebug` so the log is written.
+
+The companion remembers your setup—including credentials, all three shock profiles, and ability filters—in your OS user config directory. Ability names are runtime diagnostics and are not saved.
 
 ## Publishing a release
 

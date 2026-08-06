@@ -53,8 +53,8 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("DeadlockShock Companion")
-            .with_inner_size([380.0, 620.0])
-            .with_min_inner_size([340.0, 540.0])
+            .with_inner_size([520.0, 720.0])
+            .with_min_inner_size([420.0, 600.0])
             .with_icon(app_icon()),
         ..Default::default()
     };
