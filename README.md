@@ -36,15 +36,19 @@ That puts the addon at `dist/deadlock_death_hook.vpk`. Install and enable it in 
 cargo run --manifest-path companion/Cargo.toml --release
 ```
 
-In **Setup**, pick PiShock or OpenShock, enter your credentials, test the connection, select a device group, and try the test sound.
+In **Setup**, pick PiShock or OpenShock, enter the provider's typed setup values, test the connection, select a device group when the provider requires one, and try the test sound.
 
-In **Effects**, configure Death, Ability use, and Cooldown ready independently. Each trigger has its own fixed or random-interval shock profile. Ability-use and cooldown-ready also have independent positional-slot filters that apply across heroes; ability names appear when the addon reports them, with numbered slots as the fallback. Use the explicit Copy control to copy only shock settings between profiles without changing enablement or ability selection. Local-player death is enabled by default, while both ability triggers are opt-in. Cooldown ready covers both a normal cooldown finishing and a charged ability restoring a charge.
+In **Effects**, configure Death, Ability use, and Cooldown ready independently. Each trigger has its own explicit provider action profile; the currently available providers expose the same fixed or random-interval shock editor. Ability-use and cooldown-ready also have independent positional-slot filters that apply across heroes; ability names appear when the addon reports them, with numbered slots as the fallback. Use the explicit Copy control to copy only the active action family between profiles without changing enablement or ability selection. Local-player death is enabled by default, while both ability triggers are opt-in. Cooldown ready covers both a normal cooldown finishing and a charged ability restoring a charge.
 
-In **Game connection**, auto-detect `console.log` or enter its path, start the listener, and review listener, bridge-event, and delivery diagnostics. Deadlock must run with `-condebug` so the log is written.
+In **Game connection**, auto-detect `console.log` or enter its path, start the listener, and review listener, bridge-event, and last-action diagnostics. Deadlock must run with `-condebug` so the log is written.
 
-The companion shows a persistent amber **Updates available** panel when the locally observed companion or mod version is older than the newest known product version. The companion checks GitHub's stable latest-release endpoint in a worker thread; offline, malformed, or rate-limited responses remain diagnostic-only and never disable gameplay, listener, provider, or shock controls. Legacy or invalid mod metadata receives update/reinstall guidance without numeric comparison.
+The companion remembers your setup—including both providers' setup values, all three action profiles, and ability filters—in your OS user config directory. Ability names are runtime diagnostics and are not saved.
 
-The companion remembers your setup—including credentials, all three shock profiles, and ability filters—in your OS user config directory. Ability names are runtime diagnostics and are not saved.
+## Provider/action architecture
+
+The companion uses exhaustive built-in provider descriptors and typed extension points. `src/provider.rs` owns provider setup snapshots, target policy, optional typed test-action capabilities, connected blocking clients, tagged targets, test operations, execution, disconnect, and redacted errors. `src/action.rs` owns action families, validation, immutable resolution, safe summaries, and persistence-facing settings banks; `src/action_ui.rs` contains explicit egui editors. Event acceptance resolves an action before a bounded worker queue, so later UI edits cannot change queued work and provider calls never run on the egui thread. Optional and no-target policies pass `None` through orchestration; required adapters reject it before library calls.
+
+Saved state is strict schema 4 JSON. Schema 1, 2, and 3 states migrate losslessly into provider setup and per-trigger action banks while preserving selected provider, preferred target, filters, enablement, and log path. Available PiShock/OpenShock behavior remains shock-specific and uses the same portable bounds and at-most-once queue semantics.
 
 ## Publishing a release
 

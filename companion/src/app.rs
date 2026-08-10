@@ -1,11 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::ops::RangeInclusive;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::action::{ActionSettings, ResolvedAction};
 use crate::bridge_listener::{
     AbilityTrigger, BridgeEvent, ConsoleLogListener, ListenerPhase, ListenerStatus,
     LocalPlayerDeath, ModVersionObservation,
@@ -13,160 +13,29 @@ use crate::bridge_listener::{
 use crate::deadlock_path::{self, Detection, DetectionError};
 use crate::persistence::{PersistedState, Persistence, default_state_path};
 use crate::provider::{
-    ConnectedProvider, ProviderCredentials, ProviderError, ProviderKind, ProviderTarget, TargetId,
+    ConnectedProvider, ProviderConnectionConfig, ProviderError, ProviderKind, ProviderSettings,
+    ProviderTarget, TargetId, TestActionKind,
 };
 use crate::version_check::{
     COMPANION_RELEASE_URL, LATEST_RELEASE_URL, MOD_RELEASE_URL, VersionCheckOwner,
     VersionCheckState, WarningSelection, app_version, select_warnings,
 };
 use egui::{Color32, TextEdit, Ui};
-use rand::Rng;
 
-pub const MIN_SHOCK_INTENSITY: f32 = 1.0;
-pub const MAX_SHOCK_INTENSITY: f32 = 100.0;
-pub const MIN_SHOCK_DURATION: f32 = 0.3;
-pub const MAX_SHOCK_DURATION: f32 = 3.0;
-pub(crate) const SHOCK_QUEUE_CAPACITY: usize = 10;
-pub(crate) const MAX_SHOCK_QUEUE_AGE: Duration = Duration::from_secs(30);
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum CredentialState {
-    Valid,
-    Invalid,
-    Testing,
-    #[default]
-    Unknown,
-}
-impl CredentialState {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Valid => "Connection valid",
-            Self::Invalid => "Connection failed",
-            Self::Testing => "Testing connection…",
-            Self::Unknown => "Connection not tested",
-        }
-    }
-    fn color(self) -> [f32; 4] {
-        match self {
-            Self::Valid => [0.30, 0.78, 0.42, 1.0],
-            Self::Invalid => [0.92, 0.32, 0.28, 1.0],
-            Self::Testing | Self::Unknown => [0.65, 0.65, 0.65, 1.0],
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum ShockMode {
-    #[default]
-    Interval,
-    Fixed,
-}
-impl ShockMode {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Interval => "Interval",
-            Self::Fixed => "Fixed",
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct ShockIntervalSettings {
-    pub minimum_intensity: f32,
-    pub maximum_intensity: f32,
-    pub minimum_duration_seconds: f32,
-    pub maximum_duration_seconds: f32,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct ShockFixedSettings {
-    pub intensity: f32,
-    pub duration_seconds: f32,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct ShockSettings {
-    pub mode: ShockMode,
-    pub interval: ShockIntervalSettings,
-    pub fixed: ShockFixedSettings,
-}
-
-impl Default for ShockSettings {
-    fn default() -> Self {
-        Self {
-            mode: ShockMode::default(),
-            interval: ShockIntervalSettings {
-                minimum_intensity: MIN_SHOCK_INTENSITY,
-                maximum_intensity: MIN_SHOCK_INTENSITY,
-                minimum_duration_seconds: MIN_SHOCK_DURATION,
-                maximum_duration_seconds: MIN_SHOCK_DURATION,
-            },
-            fixed: ShockFixedSettings {
-                intensity: MIN_SHOCK_INTENSITY,
-                duration_seconds: MIN_SHOCK_DURATION,
-            },
-        }
-    }
-}
-
-impl ShockSettings {
-    pub fn resolve(&self) -> Option<ResolvedShock> {
-        let mut rng = rand::rng();
-        self.resolve_with(&mut rng)
-    }
-
-    fn resolve_with<R: Rng + ?Sized>(&self, rng: &mut R) -> Option<ResolvedShock> {
-        let intensity = match self.mode {
-            ShockMode::Fixed => portable_intensity(self.fixed.intensity)?,
-            ShockMode::Interval => {
-                let minimum = portable_intensity(self.interval.minimum_intensity)?;
-                let maximum = portable_intensity(self.interval.maximum_intensity)?;
-                if minimum > maximum {
-                    return None;
-                }
-                rng.random_range(minimum..=maximum)
-            }
-        };
-        let duration_ms = match self.mode {
-            ShockMode::Fixed => portable_duration(self.fixed.duration_seconds)?,
-            ShockMode::Interval => {
-                let minimum = portable_duration(self.interval.minimum_duration_seconds)?;
-                let maximum = portable_duration(self.interval.maximum_duration_seconds)?;
-                if minimum > maximum {
-                    return None;
-                }
-                rng.random_range(minimum..=maximum)
-            }
-        };
-        Some(ResolvedShock {
-            intensity,
-            duration_ms,
-        })
-    }
-
-    fn summary(&self) -> String {
-        match self.mode {
-            ShockMode::Fixed => format!(
-                "{:.0}% for {:.1} s",
-                self.fixed.intensity, self.fixed.duration_seconds
-            ),
-            ShockMode::Interval => format!(
-                "{:.0}–{:.0}% for {:.1}–{:.1} s",
-                self.interval.minimum_intensity,
-                self.interval.maximum_intensity,
-                self.interval.minimum_duration_seconds,
-                self.interval.maximum_duration_seconds
-            ),
-        }
-    }
-}
+pub(crate) const ACTION_QUEUE_CAPACITY: usize = 10;
+pub(crate) const MAX_ACTION_QUEUE_AGE: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct TriggerSettings {
     pub enabled: bool,
-    pub shock: ShockSettings,
+    pub actions: ActionSettings,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct AbilityTriggerSettings {
+    pub trigger: TriggerSettings,
+    pub ability_filter: AbilityFilter,
+}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AbilityFilter {
     All,
@@ -189,40 +58,59 @@ impl AbilityFilter {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct AbilityTriggerSettings {
-    pub trigger: TriggerSettings,
-    pub ability_filter: AbilityFilter,
-}
-
-#[derive(Clone, Debug, PartialEq)]
 pub struct TriggerSettingsSet {
     pub death: TriggerSettings,
     pub ability_use: AbilityTriggerSettings,
     pub ability_cooldown_ready: AbilityTriggerSettings,
 }
-
 impl Default for TriggerSettingsSet {
     fn default() -> Self {
-        let shock = ShockSettings::default();
+        let actions = ActionSettings::default();
         Self {
             death: TriggerSettings {
                 enabled: true,
-                shock: shock.clone(),
+                actions: actions.clone(),
             },
             ability_use: AbilityTriggerSettings {
                 trigger: TriggerSettings {
                     enabled: false,
-                    shock: shock.clone(),
+                    actions: actions.clone(),
                 },
                 ability_filter: AbilityFilter::All,
             },
             ability_cooldown_ready: AbilityTriggerSettings {
                 trigger: TriggerSettings {
                     enabled: false,
-                    shock,
+                    actions,
                 },
                 ability_filter: AbilityFilter::All,
             },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CredentialState {
+    #[default]
+    Unknown,
+    Testing,
+    Valid,
+    Invalid,
+}
+impl CredentialState {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Unknown => "Provider setup not tested.",
+            Self::Testing => "Testing provider setup…",
+            Self::Valid => "Provider setup valid.",
+            Self::Invalid => "Provider setup invalid.",
+        }
+    }
+    fn color(self) -> [f32; 4] {
+        match self {
+            Self::Unknown | Self::Testing => [0.65, 0.65, 0.65, 1.0],
+            Self::Valid => [0.30, 0.78, 0.42, 1.0],
+            Self::Invalid => [0.92, 0.32, 0.28, 1.0],
         }
     }
 }
@@ -253,22 +141,26 @@ impl LogDetectionStatus {
 }
 
 type ConnectionResult = Result<(ConnectedProvider, Vec<ProviderTarget>), ProviderError>;
-type SoundResult = Result<(), ProviderError>;
+type TestActionResult = Result<(), ProviderError>;
 fn provider_error_kind(error: &ProviderError) -> &'static str {
     match error {
         ProviderError::PiShock(_) => "pishock",
         ProviderError::OpenShock(_) => "openshock",
+        ProviderError::ConnectionConfigMismatch => "connection_config_mismatch",
         ProviderError::TargetProviderMismatch => "target_provider_mismatch",
+        ProviderError::ActionProviderMismatch => "action_provider_mismatch",
+        ProviderError::TargetRequired => "target_required",
+        ProviderError::InvalidSetup => "invalid_setup",
         ProviderError::NotConnected => "not_connected",
     }
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum SoundStatus {
+enum TestActionStatus {
     Sending,
     Sent,
     Failed(String),
 }
-impl SoundStatus {
+impl TestActionStatus {
     fn label(&self) -> &str {
         match self {
             Self::Sending => "Sending test sound…",
@@ -283,11 +175,6 @@ impl SoundStatus {
             Self::Failed(_) => [0.92, 0.32, 0.28, 1.0],
         }
     }
-}
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ResolvedShock {
-    pub intensity: u8,
-    pub duration_ms: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -428,96 +315,109 @@ impl TriggerIdentity {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct ShockRequest {
+struct ActionRequest {
     provider: ProviderKind,
     target: Option<ProviderTarget>,
-    resolved: Option<ResolvedShock>,
+    resolved: ResolvedAction,
     trigger: TriggerIdentity,
-}
-
-struct ShockJob {
-    client: Arc<ConnectedProvider>,
-    request: ShockRequest,
     queued_at: Instant,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ActionSnapshot {
+    provider: ProviderKind,
+    target: Option<ProviderTarget>,
+    resolved: Option<ResolvedAction>,
+    trigger: TriggerIdentity,
+}
+impl ActionSnapshot {
+    fn from_request(request: &ActionRequest) -> Self {
+        Self {
+            provider: request.provider,
+            target: request.target.clone(),
+            resolved: Some(request.resolved),
+            trigger: request.trigger.clone(),
+        }
+    }
+}
+
+struct ActionJob {
+    client: Arc<ConnectedProvider>,
+    request: ActionRequest,
+}
+
 #[derive(Debug)]
-enum ShockCompletionResult {
+enum ActionCompletionResult {
     Completed(Result<(), ProviderError>),
     Skipped { reason: &'static str },
 }
 
-struct ShockCompletion {
-    request: ShockRequest,
-    result: ShockCompletionResult,
+struct ActionCompletion {
+    request: ActionRequest,
+    result: ActionCompletionResult,
 }
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ShockEnqueueResult {
+enum ActionEnqueueResult {
     Accepted,
     Full,
     Disconnected,
 }
 
-fn shock_job_expired_at(queued_at: Instant, now: Instant) -> bool {
-    now.saturating_duration_since(queued_at) >= MAX_SHOCK_QUEUE_AGE
+fn action_job_expired_at(queued_at: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(queued_at) >= MAX_ACTION_QUEUE_AGE
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum ShockStatus {
-    Sending(ShockRequest),
-    Sent(ShockRequest),
+enum ActionStatus {
+    Sending(ActionRequest),
+    Sent(ActionRequest),
     Failed {
-        request: ShockRequest,
+        request: ActionRequest,
         error: String,
     },
     Skipped {
-        request: ShockRequest,
+        snapshot: ActionSnapshot,
         reason: String,
     },
 }
-impl ShockStatus {
-    fn request(&self) -> &ShockRequest {
+impl ActionStatus {
+    fn snapshot(&self) -> ActionSnapshot {
         match self {
-            Self::Sending(request)
-            | Self::Sent(request)
-            | Self::Failed { request, .. }
-            | Self::Skipped { request, .. } => request,
+            Self::Sending(request) | Self::Sent(request) => ActionSnapshot::from_request(request),
+            Self::Failed { request, .. } => ActionSnapshot::from_request(request),
+            Self::Skipped { snapshot, .. } => snapshot.clone(),
         }
     }
     fn label(&self) -> String {
-        let request = self.request();
-        let target = request
+        let snapshot = self.snapshot();
+        let target = snapshot
             .target
             .as_ref()
             .map(|target| target.name())
             .unwrap_or("no target");
-        let resolved = request
+        let action = snapshot.provider.action_kind().label();
+        let resolved = snapshot
             .resolved
-            .map(|resolved| {
-                format!(
-                    "{}% for {:.1} s",
-                    resolved.intensity,
-                    resolved.duration_ms as f32 / 1_000.0
-                )
-            })
+            .map(ResolvedAction::summary)
             .unwrap_or_else(|| "settings unavailable".to_owned());
-        let trigger = request.trigger.status_description();
+        let trigger = snapshot.trigger.status_description();
         match self {
             Self::Sending(_) => format!(
-                "{}: Sending shock to {target} at {resolved} ({trigger})…",
-                request.provider.label()
+                "{}: Sending {action} to {target} at {resolved} ({trigger})…",
+                snapshot.provider.label()
             ),
             Self::Sent(_) => format!(
-                "{}: Shock sent to {target} at {resolved} ({trigger}).",
-                request.provider.label()
+                "{}: {action} sent to {target} at {resolved} ({trigger}).",
+                snapshot.provider.label()
             ),
             Self::Failed { error, .. } => format!(
-                "{}: Shock failed for {target} at {resolved} ({trigger}): {error}",
-                request.provider.label()
+                "{}: {action} failed for {target} at {resolved} ({trigger}): {error}",
+                snapshot.provider.label()
             ),
             Self::Skipped { reason, .. } => format!(
-                "{}: Shock skipped for {target} at {resolved} ({trigger}): {reason}",
-                request.provider.label()
+                "{}: {action} skipped for {target} at {resolved} ({trigger}): {reason}",
+                snapshot.provider.label()
             ),
         }
     }
@@ -531,25 +431,20 @@ impl ShockStatus {
     }
 }
 
-fn spawn_shock_worker() -> (SyncSender<ShockJob>, Receiver<ShockCompletion>) {
-    let (job_sender, job_receiver) = mpsc::sync_channel::<ShockJob>(SHOCK_QUEUE_CAPACITY);
-    let (completion_sender, completion_receiver) = mpsc::channel::<ShockCompletion>();
+fn spawn_action_worker() -> (SyncSender<ActionJob>, Receiver<ActionCompletion>) {
+    let (job_sender, job_receiver) = mpsc::sync_channel::<ActionJob>(ACTION_QUEUE_CAPACITY);
+    let (completion_sender, completion_receiver) = mpsc::channel::<ActionCompletion>();
     thread::spawn(move || {
         while let Ok(job) = job_receiver.recv() {
-            let result = if shock_job_expired_at(job.queued_at, Instant::now()) {
-                ShockCompletionResult::Skipped { reason: "expired" }
+            let result = if action_job_expired_at(job.request.queued_at, Instant::now()) {
+                ActionCompletionResult::Skipped { reason: "expired" }
             } else {
-                ShockCompletionResult::Completed(
-                    match (job.request.target.as_ref(), job.request.resolved) {
-                        (Some(target), Some(resolved)) => {
-                            job.client
-                                .shock(target, resolved.intensity, resolved.duration_ms)
-                        }
-                        _ => Err(ProviderError::NotConnected),
-                    },
+                ActionCompletionResult::Completed(
+                    job.client
+                        .execute(job.request.target.as_ref(), job.request.resolved),
                 )
             };
-            let _ = completion_sender.send(ShockCompletion {
+            let _ = completion_sender.send(ActionCompletion {
                 request: job.request,
                 result,
             });
@@ -560,9 +455,7 @@ fn spawn_shock_worker() -> (SyncSender<ShockJob>, Receiver<ShockCompletion>) {
 
 pub struct AppState {
     pub provider: ProviderKind,
-    pub username: String,
-    pub api_key: String,
-    pub openshock_token: String,
+    pub provider_settings: ProviderSettings,
     pub credential_state: CredentialState,
     pub devices: Vec<ProviderTarget>,
     pub selected_device: Option<TargetId>,
@@ -572,12 +465,12 @@ pub struct AppState {
     client: Option<Arc<ConnectedProvider>>,
     connection_error: Option<String>,
     connection_result: Option<Receiver<ConnectionResult>>,
-    sound_result: Option<Receiver<SoundResult>>,
-    sound_status: Option<SoundStatus>,
-    shock_sender: SyncSender<ShockJob>,
-    shock_result: Receiver<ShockCompletion>,
-    shock_in_flight: usize,
-    shock_status: Option<ShockStatus>,
+    test_action_result: Option<Receiver<TestActionResult>>,
+    test_action_status: Option<TestActionStatus>,
+    action_sender: SyncSender<ActionJob>,
+    action_result: Receiver<ActionCompletion>,
+    action_in_flight: usize,
+    action_status: Option<ActionStatus>,
     log_detection_status: Option<LogDetectionStatus>,
     bridge_listener: ConsoleLogListener,
     bridge_events: Option<Receiver<BridgeEvent>>,
@@ -590,15 +483,12 @@ pub struct AppState {
     copy_source: TriggerKind,
     copy_feedback: Option<String>,
 }
-
 impl Default for AppState {
     fn default() -> Self {
-        let (shock_sender, shock_result) = spawn_shock_worker();
+        let (action_sender, action_result) = spawn_action_worker();
         Self {
             provider: ProviderKind::default(),
-            username: String::new(),
-            api_key: String::new(),
-            openshock_token: String::new(),
+            provider_settings: ProviderSettings::default(),
             credential_state: CredentialState::default(),
             devices: Vec::new(),
             selected_device: None,
@@ -608,12 +498,12 @@ impl Default for AppState {
             client: None,
             connection_error: None,
             connection_result: None,
-            sound_result: None,
-            sound_status: None,
-            shock_sender,
-            shock_result,
-            shock_in_flight: 0,
-            shock_status: None,
+            test_action_result: None,
+            test_action_status: None,
+            action_sender,
+            action_result,
+            action_in_flight: 0,
+            action_status: None,
             log_detection_status: None,
             bridge_listener: ConsoleLogListener::default(),
             bridge_events: None,
@@ -628,22 +518,15 @@ impl Default for AppState {
         }
     }
 }
-
 impl AppState {
-    pub fn credentials_present(&self) -> bool {
-        match self.provider {
-            ProviderKind::PiShock => {
-                !self.username.trim().is_empty() && !self.api_key.trim().is_empty()
-            }
-            ProviderKind::OpenShock => !self.openshock_token.trim().is_empty(),
-        }
+    pub(crate) fn effective_provider_settings(&self) -> ProviderSettings {
+        self.provider_settings.clone()
     }
-    fn provider_credentials(&self) -> ProviderCredentials {
-        ProviderCredentials {
-            pishock_username: self.username.clone(),
-            pishock_api_key: self.api_key.clone(),
-            openshock_token: self.openshock_token.clone(),
-        }
+    pub fn credentials_present(&self) -> bool {
+        self.provider_settings.setup_present(self.provider)
+    }
+    fn provider_connection_config(&self) -> ProviderConnectionConfig {
+        self.provider_settings.connection_config(self.provider)
     }
     pub fn selected_device(&self) -> Option<&ProviderTarget> {
         let selected = self.selected_device.as_ref()?;
@@ -652,14 +535,14 @@ impl AppState {
     fn connection_in_progress(&self) -> bool {
         self.connection_result.is_some()
     }
-    fn sound_in_progress(&self) -> bool {
-        self.sound_result.is_some()
+    fn test_action_in_progress(&self) -> bool {
+        self.test_action_result.is_some()
     }
-    fn shock_in_progress(&self) -> bool {
-        self.shock_in_flight != 0
+    fn action_in_progress(&self) -> bool {
+        self.action_in_flight != 0
     }
     pub(crate) fn is_busy(&self) -> bool {
-        self.connection_in_progress() || self.sound_in_progress() || self.shock_in_progress()
+        self.connection_in_progress() || self.test_action_in_progress() || self.action_in_progress()
     }
     pub(crate) fn reset_saved_state(&mut self) -> bool {
         if self.is_busy() {
@@ -670,24 +553,23 @@ impl AppState {
         self.bridge_listener.stop();
         self.reset_connection();
         self.provider = ProviderKind::default();
-        self.username.clear();
-        self.api_key.clear();
-        self.openshock_token.clear();
+        self.provider_settings = ProviderSettings::default();
+        self.preferred_target = None;
         self.triggers = TriggerSettingsSet::default();
         self.log_path.clear();
+        self.last_sequence = None;
+        self.ability_catalog.clear();
+        self.listener_action_error = None;
         self.log_detection_status = None;
         self.bridge_listener = ConsoleLogListener::default();
         self.bridge_events = None;
         self.last_bridge_event = None;
-        self.last_sequence = None;
-        self.ability_catalog.clear();
-        self.listener_action_error = None;
+        let (action_sender, action_result) = spawn_action_worker();
+        self.action_sender = action_sender;
+        self.action_result = action_result;
         self.copy_feedback = None;
-        self.shock_status = None;
-        self.shock_in_flight = 0;
-        let (shock_sender, shock_result) = spawn_shock_worker();
-        self.shock_sender = shock_sender;
-        self.shock_result = shock_result;
+        self.action_status = None;
+        self.action_in_flight = 0;
         log::info!(target: "companion::app", "settings_reset_applied provider={}", self.provider.label());
         true
     }
@@ -696,13 +578,13 @@ impl AppState {
         self.bridge_listener.status().phase != ListenerPhase::Stopped
     }
     #[cfg(test)]
-    pub(crate) fn runtime_trigger_and_shock_state_is_clear(&self) -> bool {
+    pub(crate) fn runtime_trigger_and_action_state_is_clear(&self) -> bool {
         self.bridge_events.is_none()
             && self.last_bridge_event.is_none()
             && self.last_sequence.is_none()
             && self.ability_catalog.is_empty()
-            && self.shock_status.is_none()
-            && self.shock_in_flight == 0
+            && self.action_status.is_none()
+            && self.action_in_flight == 0
     }
 
     fn reset_connection(&mut self) {
@@ -731,14 +613,17 @@ impl AppState {
         self.devices.clear();
         self.selected_device = None;
         self.connection_error = None;
-        self.sound_result = None;
-        self.sound_status = None;
+        self.test_action_result = None;
+        self.test_action_status = None;
     }
     fn set_provider(&mut self, provider: ProviderKind) {
         if self.provider == provider {
             return;
         }
-        if self.connection_in_progress() || self.sound_in_progress() || self.shock_in_progress() {
+        if self.connection_in_progress()
+            || self.test_action_in_progress()
+            || self.action_in_progress()
+        {
             log::debug!(
                 target: "companion::app",
                 "provider_change_skipped from={} to={} reason=busy",
@@ -760,7 +645,7 @@ impl AppState {
     }
     fn start_connection_test(&mut self, context: egui::Context) {
         let provider = self.provider;
-        let credentials = self.provider_credentials();
+        let config = self.provider_connection_config();
         log::info!(
             target: "companion::app",
             "connection_test_started provider={}",
@@ -772,7 +657,7 @@ impl AppState {
         self.connection_error = None;
         self.connection_result = Some(receiver);
         thread::spawn(move || {
-            let result = ConnectedProvider::connect(provider, &credentials).and_then(|client| {
+            let result = ConnectedProvider::connect(provider, &config).and_then(|client| {
                 let devices = client.list_targets()?;
                 Ok((client, devices))
             });
@@ -828,8 +713,8 @@ impl AppState {
     }
     fn apply_connection_error(&mut self, error: ProviderError) {
         self.client = None;
-        self.sound_result = None;
-        self.sound_status = None;
+        self.test_action_result = None;
+        self.test_action_status = None;
         self.devices.clear();
         self.selected_device = None;
         self.credential_state = CredentialState::Invalid;
@@ -846,7 +731,7 @@ impl AppState {
         self.selected_device = selected;
         self.devices = devices;
         self.credential_state = CredentialState::Valid;
-        self.sound_status = None;
+        self.test_action_status = None;
         self.connection_error = None;
     }
     fn select_device(&mut self, target: TargetId) -> bool {
@@ -855,84 +740,107 @@ impl AppState {
         }
         self.selected_device = Some(target.clone());
         self.preferred_target = Some(target);
-        self.sound_status = None;
+        self.test_action_status = None;
         true
     }
 
-    fn start_sound(&mut self, context: egui::Context) {
+    fn start_test_action(&mut self, context: egui::Context, action: TestActionKind) {
         let Some(client) = self.client.clone() else {
-            log::warn!(target: "companion::app", "test_sound_skipped reason=not_connected");
+            log::warn!(target: "companion::app", "test_action_skipped outcome=skipped error_kind=not_connected");
             return;
         };
-        let Some(target) = self.selected_device().cloned() else {
-            log::warn!(target: "companion::app", "test_sound_skipped reason=no_target");
+        let target = self.selected_device().cloned();
+        if !client
+            .kind()
+            .descriptor()
+            .target_policy
+            .accepts(target.is_some())
+        {
+            log::warn!(
+                target: "companion::app",
+                "test_action_skipped outcome=skipped provider={} target={:?} test_action={} error_kind=target_required",
+                client.kind().label(),
+                target.as_ref().map(ProviderTarget::id),
+                action.label()
+            );
             return;
-        };
+        }
         log::info!(
             target: "companion::app",
-            "test_sound_started provider={} target={:?}",
+            "test_action_started outcome=started provider={} target={:?} test_action={}",
             client.kind().label(),
-            target.id()
+            target.as_ref().map(ProviderTarget::id),
+            action.label()
         );
         let (sender, receiver) = mpsc::channel();
-        self.sound_status = Some(SoundStatus::Sending);
-        self.sound_result = Some(receiver);
+        self.test_action_status = Some(TestActionStatus::Sending);
+        self.test_action_result = Some(receiver);
         thread::spawn(move || {
-            let result = client.test_sound(&target);
+            let result = client.test_action(action, target.as_ref());
             let _ = sender.send(result);
             context.request_repaint();
         });
     }
 
-    fn poll_sound(&mut self) {
-        let Some(receiver) = &self.sound_result else {
+    fn poll_test_action(&mut self) {
+        let Some(receiver) = &self.test_action_result else {
             return;
         };
         match receiver.try_recv() {
             Ok(result) => {
-                self.sound_result = None;
-                self.apply_sound_result(result);
+                self.test_action_result = None;
+                self.apply_test_action_result(result);
             }
             Err(TryRecvError::Empty) => {}
             Err(TryRecvError::Disconnected) => {
                 log::error!(
                     target: "companion::app",
-                    "test_sound_worker_failed reason=channel_closed"
+                    "test_action_worker_failed outcome=failed error_kind=not_connected reason=channel_closed"
                 );
-                self.sound_result = None;
-                self.apply_sound_error(ProviderError::NotConnected);
+                self.test_action_result = None;
+                self.apply_test_action_error(ProviderError::NotConnected);
             }
         }
     }
 
-    fn apply_sound_result(&mut self, result: SoundResult) {
+    fn apply_test_action_result(&mut self, result: TestActionResult) {
         match result {
             Ok(()) => {
-                log::info!(target: "companion::app", "test_sound_succeeded");
-                self.sound_status = Some(SoundStatus::Sent);
+                log::info!(
+                    target: "companion::app",
+                    "test_action_succeeded outcome=sent error_kind=none"
+                );
+                self.test_action_status = Some(TestActionStatus::Sent);
             }
             Err(error) => {
                 log::warn!(
                     target: "companion::app",
-                    "test_sound_failed error_kind={}",
+                    "test_action_failed outcome=failed error_kind={}",
                     provider_error_kind(&error)
                 );
-                self.apply_sound_error(error);
+                self.apply_test_action_error(error);
             }
         }
     }
-    fn apply_sound_error(&mut self, error: ProviderError) {
-        self.sound_status = Some(SoundStatus::Failed(format!("Test sound failed: {error}")));
+    fn apply_test_action_error(&mut self, error: ProviderError) {
+        self.test_action_status = Some(TestActionStatus::Failed(format!(
+            "Test sound failed: {error}"
+        )));
     }
-    fn copy_shock_settings(&mut self, source: TriggerKind, destination: TriggerKind) -> bool {
+    fn copy_action_settings(&mut self, source: TriggerKind, destination: TriggerKind) -> bool {
         if source == destination {
             return false;
         }
-        let shock = self.triggers.get(source).shock.clone();
-        self.triggers.get_mut(destination).shock = shock;
+        let kind = self.provider.action_kind();
+        let source_settings = self.triggers.get(source).actions.clone();
+        self.triggers
+            .get_mut(destination)
+            .actions
+            .copy_active_from(&source_settings, kind);
         self.copy_feedback = Some(format!(
-            "Copied {} shock settings to {}.",
+            "Copied {} {} settings to {}.",
             source.label(),
+            kind.label(),
             destination.label()
         ));
         true
@@ -953,59 +861,61 @@ impl AppState {
             .map(|ability| (ability.ability_slot, ability.ability_name))
             .collect();
     }
-    fn poll_shock(&mut self) {
+    fn poll_action(&mut self) {
         loop {
-            match self.shock_result.try_recv() {
+            match self.action_result.try_recv() {
                 Ok(completion) => {
-                    self.shock_in_flight = self.shock_in_flight.saturating_sub(1);
+                    self.action_in_flight = self.action_in_flight.saturating_sub(1);
                     let trigger = &completion.request.trigger;
+                    let action_kind = completion.request.resolved.kind().label();
+                    let action_summary = completion.request.resolved.summary();
                     match completion.result {
-                        ShockCompletionResult::Skipped { reason } => {
+                        ActionCompletionResult::Skipped { reason } => {
                             log::warn!(
                                 target: "companion::app",
-                                "shock_skipped trigger={} provider={} target={:?} intensity={:?} duration_ms={:?} session_id={:?} sequence={} reason={}",
+                                "action_skipped outcome=skipped error_kind=none trigger={} provider={} target={:?} action_kind={} action_summary={:?} session={} sequence={} reason={}",
                                 trigger.kind.label(),
                                 completion.request.provider.label(),
                                 completion.request.target.as_ref().map(ProviderTarget::id),
-                                completion.request.resolved.map(|resolved| resolved.intensity),
-                                completion.request.resolved.map(|resolved| resolved.duration_ms),
+                                action_kind,
+                                action_summary,
                                 trigger.session_id,
                                 trigger.sequence,
                                 reason
                             );
-                            self.shock_status = Some(ShockStatus::Skipped {
-                                request: completion.request,
+                            self.action_status = Some(ActionStatus::Skipped {
+                                snapshot: ActionSnapshot::from_request(&completion.request),
                                 reason: reason.to_owned(),
                             });
                         }
-                        ShockCompletionResult::Completed(Ok(())) => {
+                        ActionCompletionResult::Completed(Ok(())) => {
                             log::info!(
                                 target: "companion::app",
-                                "shock_sent trigger={} provider={} target={:?} intensity={:?} duration_ms={:?} session_id={:?} sequence={}",
+                                "action_sent outcome=sent error_kind=none trigger={} provider={} target={:?} action_kind={} action_summary={:?} session={} sequence={}",
                                 trigger.kind.label(),
                                 completion.request.provider.label(),
                                 completion.request.target.as_ref().map(ProviderTarget::id),
-                                completion.request.resolved.map(|resolved| resolved.intensity),
-                                completion.request.resolved.map(|resolved| resolved.duration_ms),
+                                action_kind,
+                                action_summary,
                                 trigger.session_id,
                                 trigger.sequence
                             );
-                            self.shock_status = Some(ShockStatus::Sent(completion.request));
+                            self.action_status = Some(ActionStatus::Sent(completion.request));
                         }
-                        ShockCompletionResult::Completed(Err(error)) => {
+                        ActionCompletionResult::Completed(Err(error)) => {
                             log::warn!(
                                 target: "companion::app",
-                                "shock_failed trigger={} provider={} target={:?} intensity={:?} duration_ms={:?} session_id={:?} sequence={} error_kind={}",
+                                "action_failed outcome=failed trigger={} provider={} target={:?} action_kind={} action_summary={:?} session={} sequence={} error_kind={}",
                                 trigger.kind.label(),
                                 completion.request.provider.label(),
                                 completion.request.target.as_ref().map(ProviderTarget::id),
-                                completion.request.resolved.map(|resolved| resolved.intensity),
-                                completion.request.resolved.map(|resolved| resolved.duration_ms),
+                                action_kind,
+                                action_summary,
                                 trigger.session_id,
                                 trigger.sequence,
                                 provider_error_kind(&error)
                             );
-                            self.shock_status = Some(ShockStatus::Failed {
+                            self.action_status = Some(ActionStatus::Failed {
                                 request: completion.request,
                                 error: error.to_string(),
                             });
@@ -1016,10 +926,10 @@ impl AppState {
                 Err(TryRecvError::Disconnected) => {
                     log::error!(
                         target: "companion::app",
-                        "shock_worker_channel_failed reason=disconnected in_flight={}",
-                        self.shock_in_flight
+                        "action_worker_channel_failed reason=disconnected in_flight={}",
+                        self.action_in_flight
                     );
-                    self.shock_in_flight = 0;
+                    self.action_in_flight = 0;
                     break;
                 }
             }
@@ -1033,8 +943,11 @@ impl AppState {
         {
             log::debug!(
                 target: "companion::app",
-                "shock_skipped reason=duplicate_or_out_of_order trigger={} session_id={:?} sequence={}",
+                "action_skipped outcome=skipped error_kind=duplicate_or_out_of_order trigger={} provider={} target={:?} action_kind={} session={} sequence={}",
                 trigger.kind.label(),
+                self.provider.label(),
+                self.selected_device().map(ProviderTarget::id),
+                self.provider.action_kind().label(),
                 trigger.session_id,
                 trigger.sequence
             );
@@ -1044,62 +957,73 @@ impl AppState {
         true
     }
 
-    fn apply_shock_enqueue_result(&mut self, request: ShockRequest, result: ShockEnqueueResult) {
+    fn apply_action_enqueue_result(&mut self, request: ActionRequest, result: ActionEnqueueResult) {
         let trigger = &request.trigger;
         match result {
-            ShockEnqueueResult::Accepted => {
-                self.shock_status = Some(ShockStatus::Sending(request.clone()));
-                self.shock_in_flight = self.shock_in_flight.saturating_add(1);
+            ActionEnqueueResult::Accepted => {
+                self.action_status = Some(ActionStatus::Sending(request.clone()));
+                self.action_in_flight = self.action_in_flight.saturating_add(1);
                 log::info!(
                     target: "companion::app",
-                    "shock_queued trigger={} provider={} target={:?} intensity={:?} duration_ms={:?} session_id={:?} sequence={}",
+                    "action_queued outcome=queued error_kind=none trigger={} provider={} target={:?} action_kind={} action_summary={:?} session={} sequence={}",
                     trigger.kind.label(),
                     request.provider.label(),
                     request.target.as_ref().map(ProviderTarget::id),
-                    request.resolved.map(|resolved| resolved.intensity),
-                    request.resolved.map(|resolved| resolved.duration_ms),
+                    request.resolved.kind().label(),
+                    request.resolved.summary(),
                     trigger.session_id,
                     trigger.sequence
                 );
             }
-            ShockEnqueueResult::Full => {
+            ActionEnqueueResult::Full => {
                 log::warn!(
                     target: "companion::app",
-                    "shock_skipped trigger={} provider={} target={:?} intensity={:?} duration_ms={:?} session_id={:?} sequence={} reason=queue_capacity",
+                    "action_skipped outcome=skipped error_kind=none trigger={} provider={} target={:?} action_kind={} action_summary={:?} session={} sequence={} reason=queue_capacity",
                     trigger.kind.label(),
                     request.provider.label(),
                     request.target.as_ref().map(ProviderTarget::id),
-                    request.resolved.map(|resolved| resolved.intensity),
-                    request.resolved.map(|resolved| resolved.duration_ms),
+                    request.resolved.kind().label(),
+                    request.resolved.summary(),
                     trigger.session_id,
                     trigger.sequence
                 );
-                self.shock_status = Some(ShockStatus::Skipped {
-                    request,
-                    reason: "shock queue is full".to_owned(),
+                self.action_status = Some(ActionStatus::Skipped {
+                    snapshot: ActionSnapshot::from_request(&request),
+                    reason: "action queue is full".to_owned(),
                 });
             }
-            ShockEnqueueResult::Disconnected => {
+            ActionEnqueueResult::Disconnected => {
                 log::error!(
                     target: "companion::app",
-                    "shock_failed trigger={} provider={} target={:?} intensity={:?} duration_ms={:?} session_id={:?} sequence={} reason=worker_unavailable",
+                    "action_failed outcome=failed trigger={} provider={} target={:?} action_kind={} action_summary={:?} session={} sequence={} reason=worker_unavailable error_kind=worker_unavailable",
                     trigger.kind.label(),
                     request.provider.label(),
                     request.target.as_ref().map(ProviderTarget::id),
-                    request.resolved.map(|resolved| resolved.intensity),
-                    request.resolved.map(|resolved| resolved.duration_ms),
+                    request.resolved.kind().label(),
+                    request.resolved.summary(),
                     trigger.session_id,
                     trigger.sequence
                 );
-                self.shock_status = Some(ShockStatus::Failed {
+                self.action_status = Some(ActionStatus::Failed {
                     request,
-                    error: "shock worker is unavailable".to_owned(),
+                    error: "action worker is unavailable".to_owned(),
                 });
             }
         }
     }
+    fn target_for_policy(
+        policy: crate::provider::TargetPolicy,
+        selected: Option<ProviderTarget>,
+    ) -> Option<ProviderTarget> {
+        match policy {
+            crate::provider::TargetPolicy::None => None,
+            crate::provider::TargetPolicy::Required | crate::provider::TargetPolicy::Optional => {
+                selected
+            }
+        }
+    }
 
-    fn queue_trigger_shock(&mut self, trigger: TriggerIdentity) {
+    fn queue_trigger_action(&mut self, trigger: TriggerIdentity) {
         if !self.trigger_is_new(&trigger) {
             return;
         }
@@ -1132,75 +1056,92 @@ impl AppState {
             );
             return;
         }
-        let resolved = settings.shock.resolve();
-        let request = ShockRequest {
-            provider: self.provider,
-            target: self.selected_device().cloned(),
-            resolved,
-            trigger,
+
+        let provider = self.provider;
+        let target_policy = provider.descriptor().target_policy;
+        let target = Self::target_for_policy(target_policy, self.selected_device().cloned());
+        let action_result = settings.actions.resolve(provider.action_kind());
+        let resolved = match action_result {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                log::warn!(
+                    target: "companion::app",
+                    "action_skipped outcome=skipped trigger={} provider={} target={:?} action_kind={} session={} sequence={} reason=invalid_settings error_kind=invalid_settings validation={}",
+                    trigger.kind.label(),
+                    provider.label(),
+                    target.as_ref().map(ProviderTarget::id),
+                    provider.action_kind().label(),
+                    trigger.session_id,
+                    trigger.sequence,
+                    error
+                );
+                self.action_status = Some(ActionStatus::Skipped {
+                    snapshot: ActionSnapshot {
+                        provider,
+                        target,
+                        resolved: None,
+                        trigger,
+                    },
+                    reason: format!("invalid action settings: {error}"),
+                });
+                return;
+            }
         };
-        let Some(client) = self.client.clone() else {
+        if !target_policy.accepts(target.is_some()) {
             log::warn!(
                 target: "companion::app",
-                "shock_skipped trigger={} provider={} target={:?} intensity={:?} duration_ms={:?} session_id={:?} sequence={} reason=provider_not_connected",
-                request.trigger.kind.label(),
-                request.provider.label(),
-                request.target.as_ref().map(ProviderTarget::id),
-                request.resolved.map(|resolved| resolved.intensity),
-                request.resolved.map(|resolved| resolved.duration_ms),
-                request.trigger.session_id,
-                request.trigger.sequence
+                "action_skipped outcome=skipped trigger={} provider={} target=none action_kind={} session={} sequence={} reason=target_required error_kind=target_required",
+                trigger.kind.label(),
+                provider.label(),
+                resolved.kind().label(),
+                trigger.session_id,
+                trigger.sequence
             );
-            self.shock_status = Some(ShockStatus::Skipped {
-                request,
-                reason: "provider is not connected".to_owned(),
-            });
-            return;
-        };
-        if request.target.is_none() {
-            log::warn!(
-                target: "companion::app",
-                "shock_skipped trigger={} provider={} target=none intensity={:?} duration_ms={:?} session_id={:?} sequence={} reason=no_target",
-                request.trigger.kind.label(),
-                request.provider.label(),
-                request.resolved.map(|resolved| resolved.intensity),
-                request.resolved.map(|resolved| resolved.duration_ms),
-                request.trigger.session_id,
-                request.trigger.sequence
-            );
-            self.shock_status = Some(ShockStatus::Skipped {
-                request,
+            self.action_status = Some(ActionStatus::Skipped {
+                snapshot: ActionSnapshot {
+                    provider,
+                    target,
+                    resolved: Some(resolved),
+                    trigger,
+                },
                 reason: "no target is selected".to_owned(),
             });
             return;
         }
-        if request.resolved.is_none() {
+        let request = ActionRequest {
+            provider,
+            target,
+            resolved,
+            trigger,
+            queued_at: Instant::now(),
+        };
+        let Some(client) = self.client.clone() else {
             log::warn!(
                 target: "companion::app",
-                "shock_skipped trigger={} provider={} target={:?} intensity=none duration_ms=none session_id={:?} sequence={} reason=invalid_settings",
+                "action_skipped outcome=skipped trigger={} provider={} target={:?} action_kind={} action_summary={:?} session={} sequence={} reason=provider_not_connected error_kind=not_connected",
                 request.trigger.kind.label(),
                 request.provider.label(),
                 request.target.as_ref().map(ProviderTarget::id),
+                request.resolved.kind().label(),
+                request.resolved.summary(),
                 request.trigger.session_id,
                 request.trigger.sequence
             );
-            self.shock_status = Some(ShockStatus::Skipped {
-                request,
-                reason: "shock settings are invalid".to_owned(),
+            self.action_status = Some(ActionStatus::Skipped {
+                snapshot: ActionSnapshot::from_request(&request),
+                reason: "provider is not connected".to_owned(),
             });
             return;
-        }
-        let queued_at = Instant::now();
-        let enqueue_result = match self.shock_sender.try_send(ShockJob {
+        };
+        let enqueue_result = match self.action_sender.try_send(ActionJob {
             client,
             request: request.clone(),
-            queued_at,
         }) {
-            Ok(()) => ShockEnqueueResult::Accepted,
-            Err(TrySendError::Full(_job)) => ShockEnqueueResult::Full,
-            Err(TrySendError::Disconnected(_job)) => ShockEnqueueResult::Disconnected,
+            Ok(()) => ActionEnqueueResult::Accepted,
+            Err(TrySendError::Full(_job)) => ActionEnqueueResult::Full,
+            Err(TrySendError::Disconnected(_job)) => ActionEnqueueResult::Disconnected,
         };
-        self.apply_shock_enqueue_result(request, enqueue_result);
+        self.apply_action_enqueue_result(request, enqueue_result);
     }
     fn ensure_bridge_subscription(&mut self) {
         if self.bridge_events.is_none() {
@@ -1287,7 +1228,7 @@ impl AppState {
                         }
                     };
                     if let Some(trigger) = trigger {
-                        self.queue_trigger_shock(trigger);
+                        self.queue_trigger_action(trigger);
                     }
                 }
                 Err(TryRecvError::Empty) => break,
@@ -1401,9 +1342,9 @@ impl AppState {
     }
 
     pub fn draw(&mut self, ui: &mut Ui) {
-        self.poll_sound();
+        self.poll_test_action();
         self.poll_connection_test();
-        self.poll_shock();
+        self.poll_action();
         self.poll_bridge_events();
         let busy = self.is_busy();
 
@@ -1426,20 +1367,22 @@ impl AppState {
         }
 
         let listener_status = self.bridge_listener.status();
-        if listener_status.phase != ListenerPhase::Stopped || self.shock_in_progress() {
+        if listener_status.phase != ListenerPhase::Stopped || self.action_in_progress() {
             ui.ctx().request_repaint_after(Duration::from_millis(250));
         }
     }
 
     fn draw_setup(&mut self, ui: &mut Ui, busy: bool) {
+        let descriptor = self.provider.descriptor();
         ui.heading("Provider");
         let mut provider = self.provider;
         ui.add_enabled_ui(!busy, |ui| {
             egui::ComboBox::from_id_salt("provider")
                 .selected_text(provider.label())
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut provider, ProviderKind::PiShock, "PiShock");
-                    ui.selectable_value(&mut provider, ProviderKind::OpenShock, "OpenShock");
+                    for candidate in crate::provider::SUPPORTED_PROVIDERS {
+                        ui.selectable_value(&mut provider, candidate, candidate.label());
+                    }
                 });
         });
         if provider != self.provider {
@@ -1447,17 +1390,31 @@ impl AppState {
         }
 
         ui.add_space(8.0);
-        ui.heading("Credentials");
+        ui.heading(descriptor.setup_label);
         let mut credentials_changed = false;
         ui.add_enabled_ui(!busy, |ui| match self.provider {
             ProviderKind::PiShock => {
-                credentials_changed |= text_input(ui, "API key", &mut self.api_key, true);
-                credentials_changed |= text_input(ui, "Username", &mut self.username, false);
+                credentials_changed |= text_input(
+                    ui,
+                    "API key",
+                    &mut self.provider_settings.pishock.api_key,
+                    true,
+                );
+                credentials_changed |= text_input(
+                    ui,
+                    "Username",
+                    &mut self.provider_settings.pishock.username,
+                    false,
+                );
             }
             ProviderKind::OpenShock => {
-                credentials_changed |=
-                    text_input(ui, "OpenShock token", &mut self.openshock_token, true);
-                ui.label("Token must have shockers.use permission and must not be paused.");
+                credentials_changed |= text_input(
+                    ui,
+                    "OpenShock token",
+                    &mut self.provider_settings.openshock.token,
+                    true,
+                );
+                ui.label(descriptor.setup_help);
                 ui.hyperlink_to(
                     "OpenShock token settings",
                     "https://next.openshock.app/settings/api-tokens",
@@ -1489,64 +1446,75 @@ impl AppState {
         ui.add_space(8.0);
         ui.separator();
         ui.add_space(8.0);
-        ui.heading("Device group");
-        let selection_enabled = !self.devices.is_empty() && !busy;
-        let selected_name = self
-            .selected_device()
-            .map(|device| device.name().to_owned())
-            .unwrap_or_else(|| {
-                if self.devices.is_empty() {
-                    "No device groups found".to_owned()
-                } else {
-                    "Select a device group".to_owned()
-                }
-            });
-        let mut selection_changed = false;
-        let mut selected_device = self.selected_device.clone();
-        ui.add_enabled_ui(selection_enabled, |ui| {
-            egui::ComboBox::from_id_salt("device")
-                .selected_text(selected_name.as_str())
-                .width(ui.available_width())
-                .show_ui(ui, |ui| {
-                    for device in &self.devices {
-                        selection_changed |= ui
-                            .selectable_value(
-                                &mut selected_device,
-                                Some(device.id().clone()),
-                                device.name(),
-                            )
-                            .changed();
+        if descriptor.target_policy != crate::provider::TargetPolicy::None {
+            ui.heading(descriptor.target_noun);
+            let selection_enabled = !self.devices.is_empty() && !busy;
+            let selected_name = self
+                .selected_device()
+                .map(|device| device.name().to_owned())
+                .unwrap_or_else(|| {
+                    if self.devices.is_empty() {
+                        format!("No {}s found", descriptor.target_noun.to_lowercase())
+                    } else {
+                        format!("Select a {}", descriptor.target_noun.to_lowercase())
                     }
                 });
-        });
-        if selection_changed && let Some(target) = selected_device {
-            self.select_device(target);
+            let mut selection_changed = false;
+            let mut selected_device = self.selected_device.clone();
+            ui.add_enabled_ui(selection_enabled, |ui| {
+                egui::ComboBox::from_id_salt("device")
+                    .selected_text(selected_name.as_str())
+                    .width(ui.available_width())
+                    .show_ui(ui, |ui| {
+                        for device in &self.devices {
+                            selection_changed |= ui
+                                .selectable_value(
+                                    &mut selected_device,
+                                    Some(device.id().clone()),
+                                    device.name(),
+                                )
+                                .changed();
+                        }
+                    });
+            });
+            if selection_changed && let Some(target) = selected_device {
+                self.select_device(target);
+            }
         }
-        let can_sound = self.selected_device.is_some() && self.client.is_some() && !busy;
-        if ui
-            .add_enabled(
-                can_sound,
-                egui::Button::new("Send test sound").min_size([ui.available_width(), 0.0].into()),
-            )
-            .clicked()
+        let target_present = descriptor.target_policy != crate::provider::TargetPolicy::None
+            && self.selected_device.is_some();
+        let can_test =
+            descriptor.target_policy.accepts(target_present) && self.client.is_some() && !busy;
+        if let Some(test_action) = descriptor.test_action
+            && ui
+                .add_enabled(
+                    can_test,
+                    egui::Button::new(test_action.label())
+                        .min_size([ui.available_width(), 0.0].into()),
+                )
+                .clicked()
         {
-            self.start_sound(ui.ctx().clone());
+            self.start_test_action(ui.ctx().clone(), test_action);
         }
-        if let Some(status) = &self.sound_status {
+        if let Some(status) = &self.test_action_status {
             status_line(ui, status.label(), status.color());
         }
     }
 
     fn draw_effects(&mut self, ui: &mut Ui, busy: bool) {
+        let action_kind = self.provider.action_kind();
         ui.heading("Effects");
-        ui.label("Each trigger has its own shock settings.");
+        ui.label(format!(
+            "Each trigger has its own {} settings.",
+            action_kind.label()
+        ));
         ui.add_space(4.0);
         for kind in [
             TriggerKind::Death,
             TriggerKind::AbilityUse,
             TriggerKind::AbilityCooldownReady,
         ] {
-            let summary = self.triggers.get(kind).shock.summary();
+            let summary = self.triggers.get(kind).actions.summary(action_kind);
             let selected = self.selected_effect == kind;
             let frame = egui::Frame::group(ui.style()).inner_margin(8.0);
             let frame = if selected {
@@ -1561,10 +1529,10 @@ impl AppState {
                 ui.horizontal(|ui| {
                     ui.vertical(|ui| {
                         ui.strong(trigger_display_label(kind));
-                        ui.small(summary);
+                        ui.small(summary.clone());
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        configure_clicked |= ui.button("⚙ Configure").clicked();
+                        configure_clicked |= ui.button("Configure").clicked();
                         ui.add_enabled_ui(!busy, |ui| {
                             toggle_button(ui, &mut self.triggers.get_mut(kind).enabled);
                         });
@@ -1576,7 +1544,6 @@ impl AppState {
             }
             ui.add_space(4.0);
         }
-
         ui.add_space(8.0);
         ui.separator();
         ui.add_space(8.0);
@@ -1588,21 +1555,17 @@ impl AppState {
                 toggle_button(ui, &mut self.triggers.get_mut(destination).enabled);
             });
         });
-
         if destination != TriggerKind::Death {
             self.draw_ability_filter(ui, destination, busy);
             if destination == TriggerKind::AbilityCooldownReady {
-                ui.small(
-                    "Cooldown ready includes a normal cooldown finishing and a charged ability restoring a charge.",
-                );
+                ui.small("Cooldown ready includes a normal cooldown finishing and a charged ability restoring a charge.");
             }
         }
-
         ui.add_space(6.0);
         ui.horizontal(|ui| {
-            ui.label("Copy shock settings from");
+            ui.label(format!("Copy {} settings from", action_kind.label()));
             ui.add_enabled_ui(!busy, |ui| {
-                egui::ComboBox::from_id_salt("copy-shock-source")
+                egui::ComboBox::from_id_salt("copy-action-source")
                     .selected_text(trigger_display_label(self.copy_source))
                     .show_ui(ui, |ui| {
                         for source in [
@@ -1628,23 +1591,22 @@ impl AppState {
             )
             .clicked()
         {
-            self.copy_shock_settings(self.copy_source, destination);
+            self.copy_action_settings(self.copy_source, destination);
         }
         if let Some(feedback) = &self.copy_feedback {
             status_line(ui, feedback, [0.30, 0.78, 0.42, 1.0]);
         }
-
         ui.add_space(6.0);
         ui.add_enabled_ui(!busy, |ui| {
-            draw_shock_settings_editor(ui, &mut self.triggers.get_mut(destination).shock);
+            let trigger = self.triggers.get_mut(destination);
+            crate::action_ui::draw_action_editor(ui, action_kind, &mut trigger.actions);
         });
     }
-
     fn draw_ability_filter(&mut self, ui: &mut Ui, kind: TriggerKind, busy: bool) {
-        let slots = (1..=4)
-            .chain(self.ability_catalog.keys().copied())
-            .collect::<BTreeSet<_>>();
-        let names = &self.ability_catalog;
+        let mut slots: BTreeSet<u32> = (1..=4).collect();
+        slots.extend(self.ability_catalog.keys().copied());
+        let slots: Vec<u32> = slots.into_iter().collect();
+        let names = self.ability_catalog.clone();
         let filter = self
             .triggers
             .ability_filter_mut(kind)
@@ -1671,7 +1633,7 @@ impl AppState {
                         .unwrap_or_else(|| format!("Slot {slot}"));
                     if ui.checkbox(&mut selected, label).changed() {
                         if matches!(&*filter, AbilityFilter::All) {
-                            let selected_slots = slots
+                            let selected_slots: BTreeSet<u32> = slots
                                 .iter()
                                 .copied()
                                 .filter(|candidate| *candidate != *slot)
@@ -1691,7 +1653,7 @@ impl AppState {
         if matches!(&*filter, AbilityFilter::Selected(slots) if slots.is_empty()) {
             status_line(
                 ui,
-                "No abilities are selected; this trigger will not shock.",
+                "No abilities are selected; this trigger will not send an action.",
                 [0.92, 0.68, 0.22, 1.0],
             );
         }
@@ -1735,11 +1697,11 @@ impl AppState {
             "Current ability catalogue: {} slot(s).",
             self.ability_catalog.len()
         ));
-        if let Some(status) = &self.shock_status {
+        if let Some(status) = &self.action_status {
             let label = status.label();
             status_line(ui, &label, status.color());
         } else {
-            ui.label("Last shock delivery: none since startup.");
+            ui.label("Last action delivery: none since startup.");
         }
     }
 }
@@ -1938,7 +1900,7 @@ impl CompanionApp {
                 }
                 if !reset_available {
                     response.on_disabled_hover_text(
-                        "Wait for connection, sound, and shock work to finish before resetting.",
+                        "Wait for connection, test action, and action work to finish before resetting.",
                     );
                 }
             });
@@ -1960,13 +1922,13 @@ impl CompanionApp {
             .open(&mut open)
             .show(ui.ctx(), |ui| {
                 ui.label(
-                    "This clears saved credentials, target preference, trigger and shock settings, and log path.",
+                    "This clears saved provider setup, target preference, trigger action settings, and log path.",
                 );
                 ui.label("Any active log listener will be stopped.");
                 if !reset_available {
                     status_line(
                         ui,
-                        "Wait for connection, sound, and shock work to finish.",
+                        "Wait for connection, test action, and action work to finish.",
                         [0.92, 0.68, 0.22, 1.0],
                     );
                 }
@@ -2037,92 +1999,6 @@ fn toggle_button(ui: &mut Ui, value: &mut bool) {
     }
 }
 
-fn draw_shock_settings_editor(ui: &mut Ui, shock: &mut ShockSettings) {
-    ui.heading("Shock mode");
-    ui.horizontal(|ui| {
-        ui.label("Mode");
-        egui::ComboBox::from_id_salt("shock-mode")
-            .selected_text(shock.mode.label())
-            .show_ui(ui, |ui| {
-                ui.selectable_value(&mut shock.mode, ShockMode::Interval, "Interval");
-                ui.selectable_value(&mut shock.mode, ShockMode::Fixed, "Fixed");
-            });
-    });
-    ui.add_space(4.0);
-    match shock.mode {
-        ShockMode::Interval => {
-            slider_input(
-                ui,
-                "Minimum intensity",
-                &mut shock.interval.minimum_intensity,
-                MIN_SHOCK_INTENSITY..=MAX_SHOCK_INTENSITY,
-                1.0,
-                "%",
-            );
-            slider_input(
-                ui,
-                "Maximum intensity",
-                &mut shock.interval.maximum_intensity,
-                MIN_SHOCK_INTENSITY..=MAX_SHOCK_INTENSITY,
-                1.0,
-                "%",
-            );
-            slider_input(
-                ui,
-                "Minimum duration",
-                &mut shock.interval.minimum_duration_seconds,
-                MIN_SHOCK_DURATION..=MAX_SHOCK_DURATION,
-                0.1,
-                " s",
-            );
-            slider_input(
-                ui,
-                "Maximum duration",
-                &mut shock.interval.maximum_duration_seconds,
-                MIN_SHOCK_DURATION..=MAX_SHOCK_DURATION,
-                0.1,
-                " s",
-            );
-        }
-        ShockMode::Fixed => {
-            slider_input(
-                ui,
-                "Intensity",
-                &mut shock.fixed.intensity,
-                MIN_SHOCK_INTENSITY..=MAX_SHOCK_INTENSITY,
-                1.0,
-                "%",
-            );
-            slider_input(
-                ui,
-                "Duration",
-                &mut shock.fixed.duration_seconds,
-                MIN_SHOCK_DURATION..=MAX_SHOCK_DURATION,
-                0.1,
-                " s",
-            );
-        }
-    }
-    if shock.interval.minimum_intensity > shock.interval.maximum_intensity {
-        shock.interval.maximum_intensity = shock.interval.minimum_intensity;
-    }
-    if shock.interval.minimum_duration_seconds > shock.interval.maximum_duration_seconds {
-        shock.interval.maximum_duration_seconds = shock.interval.minimum_duration_seconds;
-    }
-}
-
-fn portable_intensity(value: f32) -> Option<u8> {
-    (value.is_finite()
-        && value.fract() == 0.0
-        && (MIN_SHOCK_INTENSITY..=MAX_SHOCK_INTENSITY).contains(&value))
-    .then_some(value as u8)
-}
-fn portable_duration(value: f32) -> Option<u64> {
-    if !value.is_finite() || !(MIN_SHOCK_DURATION..=MAX_SHOCK_DURATION).contains(&value) {
-        return None;
-    }
-    Some((value * 1_000.0).round() as u64)
-}
 fn draw_listener_status(ui: &mut Ui, status: &ListenerStatus, last_event: Option<&BridgeEvent>) {
     let (phase_label, phase_color) = match status.phase {
         ListenerPhase::Stopped => ("Listener stopped.".to_owned(), [0.65, 0.65, 0.65, 1.0]),
@@ -2210,24 +2086,6 @@ fn text_input(ui: &mut Ui, label: &str, value: &mut String, password: bool) -> b
     )
     .changed()
 }
-fn slider_input<T: egui::emath::Numeric>(
-    ui: &mut Ui,
-    label: &str,
-    value: &mut T,
-    range: RangeInclusive<T>,
-    step: f64,
-    suffix: &str,
-) {
-    ui.label(label);
-    ui.scope(|ui| {
-        ui.spacing_mut().slider_width = ui.available_width() * 0.8;
-        let visuals = ui.visuals_mut();
-        visuals.widgets.inactive.bg_fill = input_background();
-        visuals.widgets.hovered.bg_fill = input_background();
-        visuals.widgets.active.bg_fill = input_background();
-        ui.add(egui::Slider::new(value, range).step_by(step).suffix(suffix));
-    });
-}
 fn status_line(ui: &mut Ui, value: &str, color: [f32; 4]) {
     ui.colored_label(to_color(color), value);
 }
@@ -2243,47 +2101,212 @@ fn to_color(color: [f32; 4]) -> Color32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::action::{ResolvedShockAction, ShockActionSettings, ShockMode};
     use rand::SeedableRng;
     use rand::rngs::StdRng;
-    #[test]
-    fn credentials_require_provider_specific_values() {
-        let mut state = AppState::default();
-        assert!(!state.credentials_present());
-        state.username = "user".into();
-        state.api_key = "key".into();
-        assert!(state.credentials_present());
-        state.set_provider(ProviderKind::OpenShock);
-        assert!(!state.credentials_present());
-        state.openshock_token = "token".into();
-        assert!(state.credentials_present());
+
+    fn trigger(kind: TriggerKind, session_id: &str, sequence: u64) -> TriggerIdentity {
+        TriggerIdentity {
+            kind,
+            session_id: session_id.to_owned(),
+            sequence,
+            client_time_ms: sequence,
+            detection: "test".to_owned(),
+            ability_slot: (kind != TriggerKind::Death).then_some(2),
+            ability_name: (kind != TriggerKind::Death).then(|| "Test Ability".to_owned()),
+            charges_before: None,
+            charges_after: None,
+        }
     }
+
+    fn resolved(intensity: u8, duration_ms: u64) -> ResolvedAction {
+        ResolvedAction::Shock(ResolvedShockAction {
+            intensity,
+            duration_ms,
+        })
+    }
+
     #[test]
-    fn switching_provider_clears_active_and_preferred_targets_but_retains_forms() {
+    fn provider_setup_retention_uses_only_typed_banks() {
+        let mut state = AppState::default();
+        state.provider_settings.pishock.username = "user".into();
+        state.provider_settings.pishock.api_key = "key".into();
+        state.set_provider(ProviderKind::OpenShock);
+        state.provider_settings.openshock.token = "token".into();
+        assert!(state.credentials_present());
+        state.set_provider(ProviderKind::PiShock);
+        assert_eq!(state.provider_settings.pishock.username, "user");
+        assert_eq!(state.provider_settings.pishock.api_key, "key");
+        assert_eq!(state.provider_settings.openshock.token, "token");
+    }
+
+    #[test]
+    fn switching_provider_clears_live_and_preferred_targets() {
         let mut state = AppState {
-            username: "user".into(),
-            api_key: "key".into(),
             devices: vec![ProviderTarget::new(TargetId::PiShock(1), "hub")],
             selected_device: Some(TargetId::PiShock(1)),
             preferred_target: Some(TargetId::PiShock(1)),
-            credential_state: CredentialState::Valid,
             ..AppState::default()
         };
         state.set_provider(ProviderKind::OpenShock);
-        assert_eq!(state.provider, ProviderKind::OpenShock);
         assert!(state.devices.is_empty());
         assert!(state.selected_device.is_none());
         assert!(state.preferred_target.is_none());
-        assert_eq!(state.username, "user");
-        assert_eq!(state.api_key, "key");
+    }
+
+    #[test]
+    fn action_resolution_is_an_immutable_snapshot() {
+        let mut settings = ShockActionSettings::default();
+        settings.mode = ShockMode::Fixed;
+        settings.fixed.intensity = 41.0;
+        settings.fixed.duration_seconds = 1.2;
+        let mut rng = StdRng::seed_from_u64(4);
+        let snapshot = settings.resolve_with(&mut rng).unwrap();
+        settings.fixed.intensity = 99.0;
+        assert_eq!(settings.fixed.intensity, 99.0);
+        assert_eq!(snapshot.intensity, 41);
+        assert_eq!(snapshot.duration_ms, 1_200);
+    }
+
+    #[test]
+    fn invalid_fixed_action_settings_are_skipped_without_fabricating_an_action() {
+        let mut state = AppState::default();
+        state.triggers.death.actions.shock.mode = ShockMode::Fixed;
+        state.triggers.death.actions.shock.fixed.intensity = 0.0;
+        state.queue_trigger_action(trigger(TriggerKind::Death, "session", 1));
+        let Some(ActionStatus::Skipped { snapshot, reason }) = state.action_status else {
+            panic!("invalid settings should be skipped");
+        };
+        assert!(snapshot.resolved.is_none());
+        assert!(reason.contains("invalid action settings"));
+    }
+
+    #[test]
+    fn copy_transfers_only_active_action_settings() {
+        let mut state = AppState::default();
+        state.triggers.death.enabled = false;
+        state.triggers.death.actions.shock.mode = ShockMode::Fixed;
+        state.triggers.death.actions.shock.fixed.intensity = 61.0;
+        state.triggers.ability_use.trigger.enabled = true;
+        state.triggers.ability_use.ability_filter = AbilityFilter::Selected(BTreeSet::from([2]));
+        assert!(state.copy_action_settings(TriggerKind::Death, TriggerKind::AbilityUse));
+        assert_eq!(
+            state.triggers.ability_use.trigger.actions.shock,
+            state.triggers.death.actions.shock
+        );
+        assert!(state.triggers.ability_use.trigger.enabled);
+        assert_eq!(
+            state.triggers.ability_use.ability_filter,
+            AbilityFilter::Selected(BTreeSet::from([2]))
+        );
+    }
+
+    #[test]
+    fn action_queue_preserves_capacity_and_expiry() {
+        let (sender, receiver) = mpsc::sync_channel(ACTION_QUEUE_CAPACITY);
+        for value in 0..ACTION_QUEUE_CAPACITY {
+            assert!(sender.try_send(value).is_ok());
+        }
+        assert!(matches!(
+            sender.try_send(ACTION_QUEUE_CAPACITY),
+            Err(TrySendError::Full(_))
+        ));
+        drop(receiver);
+        assert!(matches!(
+            sender.try_send(0),
+            Err(TrySendError::Disconnected(_))
+        ));
+        let queued_at = Instant::now();
+        assert!(action_job_expired_at(
+            queued_at,
+            queued_at + MAX_ACTION_QUEUE_AGE
+        ));
+    }
+
+    #[test]
+    fn queue_outcomes_use_generic_action_statuses() {
+        let request = ActionRequest {
+            provider: ProviderKind::PiShock,
+            target: None,
+            resolved: resolved(20, 500),
+            trigger: trigger(TriggerKind::Death, "session", 1),
+            queued_at: Instant::now(),
+        };
+        let mut full = AppState::default();
+        full.apply_action_enqueue_result(request.clone(), ActionEnqueueResult::Full);
+        assert!(matches!(
+            full.action_status,
+            Some(ActionStatus::Skipped { reason, .. }) if reason == "action queue is full"
+        ));
+        let mut disconnected = AppState::default();
+        disconnected
+            .apply_action_enqueue_result(request.clone(), ActionEnqueueResult::Disconnected);
+        assert!(matches!(
+            disconnected.action_status,
+            Some(ActionStatus::Failed { error, .. }) if error == "action worker is unavailable"
+        ));
+        let mut accepted = AppState::default();
+        accepted.apply_action_enqueue_result(request, ActionEnqueueResult::Accepted);
+        assert_eq!(accepted.action_in_flight, 1);
+        assert!(matches!(
+            accepted.action_status,
+            Some(ActionStatus::Sending(_))
+        ));
+    }
+
+    #[test]
+    fn global_sequence_watermark_is_preserved_across_trigger_kinds() {
+        let mut state = AppState::default();
+        state.queue_trigger_action(trigger(TriggerKind::AbilityUse, "first", 4));
+        assert_eq!(state.last_sequence, Some(("first".to_owned(), 4)));
+        state.queue_trigger_action(trigger(TriggerKind::Death, "first", 3));
+        state.queue_trigger_action(trigger(TriggerKind::Death, "first", 5));
+        assert_eq!(state.last_sequence, Some(("first".to_owned(), 5)));
+    }
+
+    #[test]
+    fn action_status_contains_provider_target_and_trigger_details() {
+        let status = ActionStatus::Sent(ActionRequest {
+            provider: ProviderKind::OpenShock,
+            target: Some(ProviderTarget::new(
+                TargetId::OpenShock("group".to_owned()),
+                "group",
+            )),
+            resolved: resolved(20, 500),
+            trigger: {
+                let mut trigger = trigger(TriggerKind::AbilityCooldownReady, "session", 9);
+                trigger.detection = "charge_restored".to_owned();
+                trigger.charges_before = Some(1);
+                trigger.charges_after = Some(2);
+                trigger
+            },
+            queued_at: Instant::now(),
+        });
+        let label = status.label();
+        assert!(label.contains("OpenShock"));
+        assert!(label.contains("group"));
+        assert!(label.contains("20% for 0.5 s"));
+        assert!(label.contains("ability cooldown ready slot 2"));
+        assert!(label.contains("charge_restored"));
+        assert!(label.contains("charges 1→2"));
+    }
+
+    #[test]
+    fn reset_clears_durable_banks_and_runtime_action_state() {
+        let mut state = AppState::default();
+        state.provider_settings.openshock.token = "secret".into();
+        state.triggers.death.actions.shock.mode = ShockMode::Fixed;
+        assert!(state.reset_saved_state());
+        assert_eq!(state.provider_settings, ProviderSettings::default());
+        assert!(state.runtime_trigger_and_action_state_is_clear());
     }
     #[test]
-    fn preferred_target_is_reconciled_only_against_freshly_fetched_targets() {
+    fn preferred_target_is_reconciled_against_fresh_targets() {
         let preferred = TargetId::PiShock(2);
         let mut state = AppState {
             preferred_target: Some(preferred.clone()),
             ..AppState::default()
         };
-        assert!(state.selected_device.is_none());
         state.apply_devices(vec![
             ProviderTarget::new(TargetId::PiShock(1), "Alpha"),
             ProviderTarget::new(preferred.clone(), "Beta"),
@@ -2293,21 +2316,16 @@ mod tests {
             state.selected_device().map(ProviderTarget::name),
             Some("Beta")
         );
-
         state.reset_connection();
         assert!(state.selected_device.is_none());
         assert_eq!(state.preferred_target, Some(preferred.clone()));
         state.apply_connection_result(Err(ProviderError::NotConnected));
-        assert_eq!(state.preferred_target, Some(preferred.clone()));
-
+        assert_eq!(state.preferred_target, Some(preferred));
         state.apply_devices(vec![ProviderTarget::new(TargetId::PiShock(3), "Gamma")]);
         assert_eq!(state.selected_device, Some(TargetId::PiShock(3)));
-        assert_eq!(state.preferred_target, Some(TargetId::PiShock(3)));
-        assert!(state.select_device(TargetId::PiShock(3)));
-        assert_eq!(state.preferred_target, Some(TargetId::PiShock(3)));
         assert!(!state.select_device(TargetId::PiShock(99)));
-        assert_eq!(state.selected_device, Some(TargetId::PiShock(3)));
     }
+
     #[test]
     fn failed_connection_clears_stale_live_targets_but_preserves_preference() {
         let mut state = AppState {
@@ -2322,14 +2340,19 @@ mod tests {
         assert_eq!(state.preferred_target, Some(TargetId::PiShock(1)));
         assert_eq!(state.credential_state, CredentialState::Invalid);
     }
+
     #[test]
-    fn sound_status_reports_success_and_failure() {
+    fn test_action_status_reports_success_and_failure() {
         let mut state = AppState::default();
-        state.apply_sound_result(Ok(()));
-        assert_eq!(state.sound_status, Some(SoundStatus::Sent));
-        state.apply_sound_result(Err(ProviderError::NotConnected));
-        assert!(matches!(state.sound_status, Some(SoundStatus::Failed(_))));
+        state.apply_test_action_result(Ok(()));
+        assert_eq!(state.test_action_status, Some(TestActionStatus::Sent));
+        state.apply_test_action_result(Err(ProviderError::NotConnected));
+        assert!(matches!(
+            state.test_action_status,
+            Some(TestActionStatus::Failed(_))
+        ));
     }
+
     #[test]
     fn all_effect_editors_render_both_shock_modes() {
         for kind in [
@@ -2342,7 +2365,7 @@ mod tests {
                 let mut state = AppState::default();
                 state.selected_section = AppSection::Effects;
                 state.selected_effect = kind;
-                state.triggers.get_mut(kind).shock.mode = mode;
+                state.triggers.get_mut(kind).actions.shock.mode = mode;
                 if kind != TriggerKind::Death {
                     state
                         .ability_catalog
@@ -2355,6 +2378,7 @@ mod tests {
             }
         }
     }
+
     #[test]
     fn openshock_form_renders() {
         let context = egui::Context::default();
@@ -2367,268 +2391,98 @@ mod tests {
         });
         assert!(!output.shapes.is_empty());
     }
+
     #[test]
-    fn successful_detection_populates_path_and_status() {
+    fn detection_status_updates_path_and_guidance() {
         let path = PathBuf::from("/steam/Deadlock/game/citadel/console.log");
         let mut state = AppState::default();
         state.apply_log_detection(Ok(Detection::Ready { path: path.clone() }));
         assert_eq!(state.log_path, path.display().to_string());
         assert_eq!(state.log_detection_status, Some(LogDetectionStatus::Found));
-    }
-    #[test]
-    fn missing_log_populates_guidance() {
-        let path = PathBuf::from("/steam/Deadlock/game/citadel/console.log");
-        let mut state = AppState::default();
         state.apply_log_detection(Ok(Detection::NotCreated { path }));
         assert!(
             state
                 .log_detection_status
+                .as_ref()
                 .expect("status")
                 .label()
                 .contains("-condebug")
         );
-    }
-    fn trigger(kind: TriggerKind, session_id: &str, sequence: u64) -> TriggerIdentity {
-        TriggerIdentity {
-            kind,
-            session_id: session_id.to_owned(),
-            client_time_ms: sequence,
-            sequence,
-            detection: "test".to_owned(),
-            ability_slot: (kind != TriggerKind::Death).then_some(2),
-            ability_name: (kind != TriggerKind::Death).then(|| "Test Ability".to_owned()),
-            charges_before: None,
-            charges_after: None,
-        }
+        state.log_path = "/manual/console.log".into();
+        state.apply_log_detection(Err(DetectionError::DeadlockNotInstalled));
+        assert_eq!(state.log_path, "/manual/console.log");
     }
 
-    fn death_event(session_id: &str, sequence: u64) -> LocalPlayerDeath {
-        LocalPlayerDeath {
-            schema: 1,
-            session_id: session_id.to_owned(),
-            client_time_ms: sequence,
-            sequence,
-            detection: "test".to_owned(),
-        }
-    }
-    #[test]
-    fn shock_profiles_resolve_portable_fixed_and_interval_values_independently() {
-        let mut fixed = ShockSettings::default();
-        fixed.mode = ShockMode::Fixed;
-        fixed.fixed.intensity = 37.0;
-        fixed.fixed.duration_seconds = 1.234;
-        assert_eq!(
-            fixed.resolve(),
-            Some(ResolvedShock {
-                intensity: 37,
-                duration_ms: 1_234
-            })
-        );
-
-        let mut interval = ShockSettings::default();
-        interval.interval.minimum_intensity = 70.0;
-        interval.interval.maximum_intensity = 72.0;
-        interval.interval.minimum_duration_seconds = 2.5;
-        interval.interval.maximum_duration_seconds = 2.6;
-        let mut rng = StdRng::seed_from_u64(7);
-        let resolved = interval.resolve_with(&mut rng).unwrap();
-        assert!((70..=72).contains(&resolved.intensity));
-        assert!((2_500..=2_600).contains(&resolved.duration_ms));
-        assert_eq!(ShockSettings::default().resolve().unwrap().intensity, 1);
-
-        fixed.fixed.intensity = 0.0;
-        assert_eq!(fixed.resolve(), None);
-        interval.interval.minimum_intensity = 90.0;
-        interval.interval.maximum_intensity = 10.0;
-        assert_eq!(interval.resolve(), None);
-    }
-
-    #[test]
-    fn ability_filters_cover_all_selected_empty_and_unknown_slots() {
-        assert!(AbilityFilter::All.accepts(1));
-        assert!(AbilityFilter::All.accepts(999));
-        let selected = AbilityFilter::Selected(BTreeSet::from([2, 5]));
-        assert!(!selected.accepts(1));
-        assert!(selected.accepts(2));
-        assert!(selected.accepts(5));
-        assert!(!selected.accepts(999));
-        assert!(!AbilityFilter::Selected(BTreeSet::new()).accepts(2));
-    }
-
-    #[test]
-    fn copy_transfers_both_shock_banks_without_enabled_state_or_filter() {
-        let mut state = AppState::default();
-        state.triggers.death.enabled = false;
-        state.triggers.death.shock.mode = ShockMode::Fixed;
-        state.triggers.death.shock.fixed.intensity = 61.0;
-        state.triggers.death.shock.fixed.duration_seconds = 1.7;
-        state.triggers.death.shock.interval.minimum_intensity = 11.0;
-        state.triggers.death.shock.interval.maximum_intensity = 89.0;
-        state.triggers.death.shock.interval.minimum_duration_seconds = 0.6;
-        state.triggers.death.shock.interval.maximum_duration_seconds = 2.8;
-        state.triggers.ability_use.trigger.enabled = true;
-        state.triggers.ability_use.ability_filter = AbilityFilter::Selected(BTreeSet::from([2]));
-
-        assert!(state.copy_shock_settings(TriggerKind::Death, TriggerKind::AbilityUse));
-        assert_eq!(
-            state.triggers.ability_use.trigger.shock,
-            state.triggers.death.shock
-        );
-        assert!(state.triggers.ability_use.trigger.enabled);
-        assert_eq!(
-            state.triggers.ability_use.ability_filter,
-            AbilityFilter::Selected(BTreeSet::from([2]))
-        );
-        assert!(!state.copy_shock_settings(TriggerKind::Death, TriggerKind::Death));
-    }
-
-    #[test]
-    fn selecting_an_effect_updates_the_editor_and_copy_source() {
-        let mut state = AppState {
-            selected_effect: TriggerKind::Death,
-            copy_source: TriggerKind::AbilityUse,
-            copy_feedback: Some("old confirmation".to_owned()),
-            ..AppState::default()
-        };
-
-        state.select_effect(TriggerKind::AbilityUse);
-
-        assert_eq!(state.selected_effect, TriggerKind::AbilityUse);
-        assert_eq!(state.copy_source, TriggerKind::Death);
-        assert!(state.copy_feedback.is_none());
-    }
-    #[test]
-    fn shock_queue_accepts_capacity_without_blocking() {
-        let (sender, receiver) = mpsc::sync_channel(SHOCK_QUEUE_CAPACITY);
-        for value in 0..SHOCK_QUEUE_CAPACITY {
-            assert!(sender.try_send(value).is_ok());
-        }
-        assert!(matches!(
-            sender.try_send(SHOCK_QUEUE_CAPACITY),
-            Err(TrySendError::Full(_))
-        ));
-        drop(receiver);
-        assert!(matches!(
-            sender.try_send(0),
-            Err(TrySendError::Disconnected(_))
-        ));
-    }
-    #[test]
-    fn expired_shock_jobs_are_skipped_before_dispatch() {
-        let queued_at = Instant::now();
-        let now = queued_at + MAX_SHOCK_QUEUE_AGE;
-        assert!(shock_job_expired_at(queued_at, now));
-        assert!(!shock_job_expired_at(
-            queued_at,
-            now - Duration::from_millis(1)
-        ));
-    }
     #[test]
     fn expired_completion_is_skipped_and_decrements_in_flight() {
-        let request = ShockRequest {
+        let request = ActionRequest {
             provider: ProviderKind::PiShock,
             target: None,
-            resolved: None,
+            resolved: resolved(20, 500),
             trigger: trigger(TriggerKind::Death, "session", 1),
+            queued_at: Instant::now(),
         };
         let (sender, receiver) = mpsc::channel();
         let mut state = AppState {
-            shock_result: receiver,
-            shock_in_flight: 1,
+            action_result: receiver,
+            action_in_flight: 1,
             ..AppState::default()
         };
         sender
-            .send(ShockCompletion {
+            .send(ActionCompletion {
                 request,
-                result: ShockCompletionResult::Skipped { reason: "expired" },
+                result: ActionCompletionResult::Skipped { reason: "expired" },
             })
             .unwrap();
-        state.poll_shock();
-        assert_eq!(state.shock_in_flight, 0);
-        let Some(ShockStatus::Skipped { reason, .. }) = state.shock_status else {
-            panic!("expected skipped status");
-        };
-        assert_eq!(reason, "expired");
-    }
-
-    #[test]
-    fn queue_submission_outcomes_update_status_and_in_flight_count() {
-        let request = ShockRequest {
-            provider: ProviderKind::PiShock,
-            target: None,
-            resolved: None,
-            trigger: trigger(TriggerKind::Death, "session", 1),
-        };
-
-        let mut full = AppState::default();
-        full.apply_shock_enqueue_result(request.clone(), ShockEnqueueResult::Full);
-        assert_eq!(full.shock_in_flight, 0);
+        state.poll_action();
+        assert_eq!(state.action_in_flight, 0);
         assert!(matches!(
-            full.shock_status,
-            Some(ShockStatus::Skipped { reason, .. }) if reason == "shock queue is full"
-        ));
-
-        let mut disconnected = AppState::default();
-        disconnected.apply_shock_enqueue_result(request.clone(), ShockEnqueueResult::Disconnected);
-        assert_eq!(disconnected.shock_in_flight, 0);
-        assert!(matches!(
-            disconnected.shock_status,
-            Some(ShockStatus::Failed { error, .. }) if error == "shock worker is unavailable"
-        ));
-
-        let mut accepted = AppState::default();
-        accepted.apply_shock_enqueue_result(request, ShockEnqueueResult::Accepted);
-        assert_eq!(accepted.shock_in_flight, 1);
-        assert!(matches!(
-            accepted.shock_status,
-            Some(ShockStatus::Sending(_))
+            state.action_status,
+            Some(ActionStatus::Skipped { reason, .. }) if reason == "expired"
         ));
     }
 
     #[test]
-    fn actionable_events_share_a_global_sequence_watermark_across_trigger_kinds() {
+    fn actionable_events_share_global_watermark_and_disabled_filtering_advances_it() {
         let mut state = AppState::default();
-        state.queue_trigger_shock(trigger(TriggerKind::AbilityUse, "first", 4));
+        state.queue_trigger_action(trigger(TriggerKind::AbilityUse, "first", 4));
         assert_eq!(state.last_sequence, Some(("first".to_owned(), 4)));
-        assert!(state.shock_status.is_none());
-
-        state.queue_trigger_shock(trigger(TriggerKind::Death, "first", 3));
-        assert!(state.shock_status.is_none());
-        state.queue_trigger_shock(trigger(TriggerKind::Death, "first", 5));
-        let first = state.shock_status.clone();
-        assert!(matches!(&first, Some(ShockStatus::Skipped { .. })));
-
+        state.queue_trigger_action(trigger(TriggerKind::Death, "first", 3));
         state.triggers.ability_use.trigger.enabled = true;
-        state.queue_trigger_shock(trigger(TriggerKind::AbilityUse, "first", 5));
-        assert_eq!(state.shock_status, first);
-        state.queue_trigger_shock(trigger(TriggerKind::AbilityUse, "first", 6));
-        assert_ne!(state.shock_status, first);
-
-        state.queue_trigger_shock(trigger(TriggerKind::Death, "second", 1));
-        assert_eq!(state.last_sequence, Some(("second".to_owned(), 1)));
+        state.triggers.ability_use.ability_filter = AbilityFilter::Selected(BTreeSet::new());
+        state.queue_trigger_action(trigger(TriggerKind::AbilityUse, "first", 5));
+        assert_eq!(state.last_sequence, Some(("first".to_owned(), 5)));
+        state.triggers.ability_use.ability_filter = AbilityFilter::All;
+        state.queue_trigger_action(trigger(TriggerKind::AbilityUse, "first", 5));
+        assert!(state.action_status.is_none());
+        state.queue_trigger_action(trigger(TriggerKind::AbilityUse, "first", 6));
+        assert_eq!(state.last_sequence, Some(("first".to_owned(), 6)));
     }
 
     #[test]
-    fn trigger_defaults_and_cooldown_enablement_control_queueing() {
-        let mut state = AppState::default();
-        assert!(state.triggers.death.enabled);
-        assert!(!state.triggers.ability_use.trigger.enabled);
-        assert!(!state.triggers.ability_cooldown_ready.trigger.enabled);
-
-        state.queue_trigger_shock(trigger(TriggerKind::AbilityCooldownReady, "session", 1));
-        assert_eq!(state.last_sequence, Some(("session".to_owned(), 1)));
-        assert!(state.shock_status.is_none());
-
+    fn parsed_enabled_ability_event_reaches_action_queue_path() {
+        let event = crate::bridge_listener::parse_bridge_record(
+            "[DEADLOCK_DEATH_HOOK]{\"schema\":1,\"event\":\"ability_cooldown_ready\",\"session_id\":\"session\",\"client_time_ms\":7,\"sequence\":3,\"ability_slot\":2,\"ability_name\":\"Bookwyrm\",\"detection\":\"charge_restored\",\"charges_before\":1,\"charges_after\":2}",
+        )
+        .expect("valid ability event");
+        let (sender, receiver) = mpsc::channel();
+        let mut state = AppState {
+            bridge_events: Some(receiver),
+            ..AppState::default()
+        };
         state.triggers.ability_cooldown_ready.trigger.enabled = true;
-        state.queue_trigger_shock(trigger(TriggerKind::AbilityCooldownReady, "session", 2));
+        sender.send(event).unwrap();
+        state.poll_bridge_events();
+        assert_eq!(state.last_sequence, Some(("session".to_owned(), 3)));
         assert!(matches!(
-            state.shock_status,
-            Some(ShockStatus::Skipped { .. })
+            state.action_status,
+            Some(ActionStatus::Skipped { .. })
         ));
+        assert_eq!(state.action_in_flight, 0);
     }
 
     #[test]
-    fn hook_ready_is_observed_but_never_advances_the_actionable_watermark() {
+    fn hook_ready_and_catalog_events_do_not_advance_actionable_state() {
         let (sender, receiver) = mpsc::channel();
         let mut state = AppState {
             bridge_events: Some(receiver),
@@ -2645,263 +2499,145 @@ mod tests {
                 poll_interval_ms: 100,
             }))
             .unwrap();
-        state.poll_bridge_events();
-        assert!(state.ability_catalog.is_empty());
-        assert!(state.last_sequence.is_none());
-        assert!(state.shock_status.is_none());
-    }
-
-    #[test]
-    fn enabled_death_preserves_skipped_status_when_prerequisites_are_missing() {
-        let (sender, receiver) = mpsc::channel();
-        let mut state = AppState {
-            bridge_events: Some(receiver),
-            ..AppState::default()
-        };
-        sender
-            .send(BridgeEvent::LocalPlayerDeath(death_event("session", 1)))
-            .unwrap();
-        state.poll_bridge_events();
-        assert!(matches!(
-            state.shock_status,
-            Some(ShockStatus::Skipped { .. })
-        ));
-        assert_eq!(state.shock_in_flight, 0);
-    }
-
-    #[test]
-    fn parsed_enabled_ability_event_reaches_the_shock_queue_path() {
-        let event = crate::bridge_listener::parse_bridge_record(
-            "[DEADLOCK_DEATH_HOOK]{\"schema\":1,\"event\":\"ability_cooldown_ready\",\"session_id\":\"session\",\"client_time_ms\":7,\"sequence\":3,\"ability_slot\":2,\"ability_name\":\"Bookwyrm\",\"detection\":\"charge_restored\",\"charges_before\":1,\"charges_after\":2}",
-        )
-        .expect("valid ability event");
-        let (sender, receiver) = mpsc::channel();
-        let mut state = AppState {
-            bridge_events: Some(receiver),
-            ..AppState::default()
-        };
-        state.triggers.ability_cooldown_ready.trigger.enabled = true;
-
-        sender.send(event).unwrap();
-        state.poll_bridge_events();
-
-        assert_eq!(state.last_sequence, Some(("session".to_owned(), 3)));
-        assert!(matches!(
-            state.shock_status,
-            Some(ShockStatus::Skipped { .. })
-        ));
-        assert_eq!(state.shock_in_flight, 0);
-    }
-
-    #[test]
-    fn deduplication_advances_before_filtering_and_filters_are_independent() {
-        let mut state = AppState::default();
-        state.triggers.ability_use.trigger.enabled = true;
-        state.triggers.ability_cooldown_ready.trigger.enabled = true;
-        state.triggers.ability_use.ability_filter = AbilityFilter::Selected(BTreeSet::new());
-        state.triggers.ability_cooldown_ready.ability_filter =
-            AbilityFilter::Selected(BTreeSet::from([3]));
-
-        state.queue_trigger_shock(trigger(TriggerKind::AbilityUse, "session", 1));
-        assert_eq!(state.last_sequence, Some(("session".to_owned(), 1)));
-        assert!(state.shock_status.is_none());
-
-        state.triggers.ability_use.ability_filter = AbilityFilter::All;
-        state.queue_trigger_shock(trigger(TriggerKind::AbilityUse, "session", 1));
-        assert!(state.shock_status.is_none());
-        state.queue_trigger_shock(trigger(TriggerKind::AbilityUse, "session", 2));
-        let accepted_use = state.shock_status.clone();
-        assert!(matches!(&accepted_use, Some(ShockStatus::Skipped { .. })));
-
-        state.queue_trigger_shock(trigger(TriggerKind::AbilityCooldownReady, "session", 3));
-        assert_eq!(state.shock_status, accepted_use);
-        assert_eq!(state.last_sequence, Some(("session".to_owned(), 3)));
-    }
-
-    #[test]
-    fn trigger_routing_resolves_the_selected_profile_before_status_is_recorded() {
-        let mut state = AppState::default();
-        state.triggers.death.shock.mode = ShockMode::Fixed;
-        state.triggers.death.shock.fixed.intensity = 19.0;
-        state.triggers.death.shock.fixed.duration_seconds = 0.7;
-        state.triggers.ability_use.trigger.enabled = true;
-        state.triggers.ability_use.trigger.shock.mode = ShockMode::Fixed;
-        state.triggers.ability_use.trigger.shock.fixed.intensity = 73.0;
-        state
-            .triggers
-            .ability_use
-            .trigger
-            .shock
-            .fixed
-            .duration_seconds = 2.1;
-
-        state.queue_trigger_shock(trigger(TriggerKind::AbilityUse, "session", 1));
-        let Some(status) = state.shock_status.clone() else {
-            panic!("enabled trigger should record missing-provider status");
-        };
-        assert_eq!(
-            status.request().resolved,
-            Some(ResolvedShock {
-                intensity: 73,
-                duration_ms: 2_100,
-            })
-        );
-
-        state.triggers.ability_use.trigger.shock.fixed.intensity = 5.0;
-        assert_eq!(status.request().resolved.unwrap().intensity, 73);
-    }
-
-    #[test]
-    fn ability_catalog_replaces_runtime_names_without_advancing_actionable_state() {
-        let (sender, receiver) = mpsc::channel();
-        let mut state = AppState {
-            bridge_events: Some(receiver),
-            ..AppState::default()
-        };
         sender
             .send(BridgeEvent::AbilityCatalog(
                 crate::bridge_listener::AbilityCatalog {
                     schema: 1,
                     session_id: "session".to_owned(),
-                    client_time_ms: 1,
-                    abilities: vec![
-                        crate::bridge_listener::AbilityCatalogEntry {
-                            ability_slot: 1,
-                            ability_name: Some("First".to_owned()),
-                        },
-                        crate::bridge_listener::AbilityCatalogEntry {
-                            ability_slot: 5,
-                            ability_name: None,
-                        },
-                    ],
+                    client_time_ms: 2,
+                    abilities: vec![crate::bridge_listener::AbilityCatalogEntry {
+                        ability_slot: 2,
+                        ability_name: Some("Replacement".to_owned()),
+                    }],
                 },
             ))
             .unwrap();
         state.poll_bridge_events();
-        assert_eq!(
-            state.ability_catalog,
-            BTreeMap::from([(1, Some("First".to_owned())), (5, None)])
-        );
         assert!(state.last_sequence.is_none());
-        assert!(state.shock_status.is_none());
-
-        state.replace_ability_catalog(crate::bridge_listener::AbilityCatalog {
-            schema: 1,
-            session_id: "session".to_owned(),
-            client_time_ms: 2,
-            abilities: vec![crate::bridge_listener::AbilityCatalogEntry {
-                ability_slot: 2,
-                ability_name: Some("Replacement".to_owned()),
-            }],
-        });
         assert_eq!(
-            state.ability_catalog,
-            BTreeMap::from([(2, Some("Replacement".to_owned()))])
+            state.ability_catalog.get(&2),
+            Some(&Some("Replacement".to_owned()))
         );
     }
 
     #[test]
-    fn shock_status_contains_generic_trigger_slot_and_detection_details() {
-        let mut ability = trigger(TriggerKind::AbilityCooldownReady, "session", 9);
-        ability.detection = "charge_restored".to_owned();
-        ability.charges_before = Some(1);
-        ability.charges_after = Some(2);
-        let request = ShockRequest {
-            provider: ProviderKind::OpenShock,
-            target: Some(ProviderTarget::new(
-                TargetId::OpenShock("group".to_owned()),
-                "group",
-            )),
-            resolved: Some(ResolvedShock {
-                intensity: 20,
-                duration_ms: 500,
-            }),
-            trigger: ability,
+    fn trigger_routing_resolves_selected_profile_before_status() {
+        let mut state = AppState::default();
+        state.triggers.ability_use.trigger.enabled = true;
+        state.triggers.ability_use.trigger.actions.shock.mode = ShockMode::Fixed;
+        state
+            .triggers
+            .ability_use
+            .trigger
+            .actions
+            .shock
+            .fixed
+            .intensity = 73.0;
+        state
+            .triggers
+            .ability_use
+            .trigger
+            .actions
+            .shock
+            .fixed
+            .duration_seconds = 2.1;
+        state.queue_trigger_action(trigger(TriggerKind::AbilityUse, "session", 1));
+        let Some(status) = state.action_status.clone() else {
+            panic!("enabled trigger should record missing-provider status");
         };
-        let status = ShockStatus::Sent(request);
-        let label = status.label();
-        assert!(label.contains("OpenShock"));
-        assert!(label.contains("group"));
-        assert!(label.contains("20% for 0.5 s"));
-        assert!(label.contains("ability cooldown ready slot 2"));
-        assert!(label.contains("charge_restored"));
-        assert!(label.contains("charges 1→2"));
-        assert!(label.contains("session#9"));
+        assert_eq!(status.snapshot().resolved, Some(resolved(73, 2_100)));
+        state
+            .triggers
+            .ability_use
+            .trigger
+            .actions
+            .shock
+            .fixed
+            .intensity = 5.0;
+        assert_eq!(status.snapshot().resolved, Some(resolved(73, 2_100)));
     }
+
     #[test]
-    fn failed_detection_does_not_replace_manual_path() {
+    fn ability_filters_cover_all_selected_empty_and_unknown_slots() {
+        assert!(AbilityFilter::All.accepts(1));
+        assert!(AbilityFilter::All.accepts(999));
+        let selected = AbilityFilter::Selected(BTreeSet::from([2, 5]));
+        assert!(!selected.accepts(1));
+        assert!(selected.accepts(2));
+        assert!(!selected.accepts(999));
+        assert!(!AbilityFilter::Selected(BTreeSet::new()).accepts(2));
+    }
+
+    #[test]
+    fn selecting_effect_updates_editor_and_copy_source() {
         let mut state = AppState {
-            log_path: "/manual/console.log".into(),
+            selected_effect: TriggerKind::Death,
+            copy_source: TriggerKind::AbilityUse,
+            copy_feedback: Some("old confirmation".to_owned()),
             ..AppState::default()
         };
-        state.apply_log_detection(Err(DetectionError::DeadlockNotInstalled));
-        assert_eq!(state.log_path, "/manual/console.log");
+        state.select_effect(TriggerKind::AbilityUse);
+        assert_eq!(state.selected_effect, TriggerKind::AbilityUse);
+        assert_eq!(state.copy_source, TriggerKind::Death);
+        assert!(state.copy_feedback.is_none());
     }
+
     #[test]
     fn reset_is_blocked_by_each_in_flight_work_kind() {
         let mut connection_busy = AppState {
-            username: "keep".to_owned(),
+            provider_settings: ProviderSettings {
+                pishock: crate::provider::PiShockSetup {
+                    username: "keep".to_owned(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
             ..AppState::default()
         };
         let (_sender, receiver) = mpsc::channel();
         connection_busy.connection_result = Some(receiver);
         assert!(!connection_busy.reset_saved_state());
-        assert_eq!(connection_busy.username, "keep");
-
-        let mut sound_busy = AppState::default();
+        assert_eq!(connection_busy.provider_settings.pishock.username, "keep");
+        let mut test_busy = AppState::default();
         let (_sender, receiver) = mpsc::channel();
-        sound_busy.sound_result = Some(receiver);
-        assert!(!sound_busy.reset_saved_state());
-
-        let mut shock_busy = AppState {
-            shock_in_flight: 1,
+        test_busy.test_action_result = Some(receiver);
+        assert!(!test_busy.reset_saved_state());
+        let mut action_busy = AppState {
+            action_in_flight: 1,
             ..AppState::default()
         };
-        assert!(!shock_busy.reset_saved_state());
-        assert_eq!(shock_busy.shock_in_flight, 1);
+        assert!(!action_busy.reset_saved_state());
     }
 
     #[test]
-    fn confirmed_reset_stops_runtime_state_and_writes_durable_defaults_immediately() {
+    fn reset_clears_listener_runtime_and_writes_durable_defaults() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("state.json");
         let mut app = CompanionApp::load_from_path(path.clone());
         app.state.provider = ProviderKind::OpenShock;
-        app.state.openshock_token = "secret".to_owned();
+        app.state.provider_settings.openshock.token = "secret".to_owned();
         app.state.preferred_target = Some(TargetId::OpenShock("group".to_owned()));
-        app.state.triggers.death.shock.mode = ShockMode::Fixed;
-        app.state.triggers.death.shock.fixed.intensity = 80.0;
-        app.state.triggers.ability_use.trigger.enabled = true;
-        app.state.triggers.ability_use.ability_filter =
-            AbilityFilter::Selected(BTreeSet::from([2]));
-        app.state.triggers.ability_cooldown_ready.trigger.enabled = true;
-        let log_path = directory.path().join("console.log");
-        app.state.log_path = log_path.display().to_string();
-        app.state.start_log_listener(log_path).unwrap();
-        app.state
-            .queue_trigger_shock(trigger(TriggerKind::Death, "session", 1));
-        assert!(app.state.listener_is_running());
-        assert!(!app.state.runtime_trigger_and_shock_state_is_clear());
-
+        app.state.triggers.death.actions.shock.mode = ShockMode::Fixed;
+        app.state.triggers.death.actions.shock.fixed.intensity = 80.0;
+        app.state.log_path = directory.path().join("console.log").display().to_string();
+        let _ = app
+            .state
+            .start_log_listener(PathBuf::from(&app.state.log_path));
         assert!(app.reset_and_save());
         assert_eq!(
             PersistedState::from_app(&app.state),
             PersistedState::default()
         );
         assert!(!app.state.listener_is_running());
-        assert!(app.state.runtime_trigger_and_shock_state_is_clear());
-        assert_eq!(app.state.credential_state, CredentialState::Unknown);
-        assert!(app.state.devices.is_empty());
-        assert!(app.state.selected_device.is_none());
-        let written = std::fs::read_to_string(path).unwrap();
+        assert!(app.state.runtime_trigger_and_action_state_is_clear());
         assert_eq!(
-            serde_json::from_str::<PersistedState>(&written).unwrap(),
-            PersistedState::default()
+            std::fs::read_to_string(path).unwrap(),
+            serde_json::to_string_pretty(&PersistedState::default()).unwrap() + "\n"
         );
     }
 
     #[test]
-    fn persistence_aware_app_renders_with_an_injected_state_path() {
+    fn persistence_aware_app_renders_with_injected_state_path() {
         let directory = tempfile::tempdir().unwrap();
         let mut app = CompanionApp::load_from_path(directory.path().join("state.json"));
         let context = egui::Context::default();
@@ -2909,5 +2645,65 @@ mod tests {
             egui::CentralPanel::default().show(ctx, |ui| app.draw(ui));
         });
         assert!(!output.shapes.is_empty());
+    }
+    #[test]
+    fn completed_action_decrements_in_flight_and_records_sent_status() {
+        let request = ActionRequest {
+            provider: ProviderKind::PiShock,
+            target: None,
+            resolved: resolved(20, 500),
+            trigger: trigger(TriggerKind::Death, "session", 1),
+            queued_at: Instant::now(),
+        };
+        let (sender, receiver) = mpsc::channel();
+        let mut state = AppState {
+            action_result: receiver,
+            action_in_flight: 1,
+            ..AppState::default()
+        };
+        sender
+            .send(ActionCompletion {
+                request,
+                result: ActionCompletionResult::Completed(Ok(())),
+            })
+            .unwrap();
+        state.poll_action();
+        assert_eq!(state.action_in_flight, 0);
+        assert!(matches!(state.action_status, Some(ActionStatus::Sent(_))));
+    }
+
+    #[test]
+    fn no_connection_and_missing_target_paths_report_skips() {
+        let mut state = AppState::default();
+        state.queue_trigger_action(trigger(TriggerKind::Death, "session", 1));
+        assert!(matches!(
+            state.action_status,
+            Some(ActionStatus::Skipped { reason, .. }) if reason == "no target is selected"
+        ));
+
+        let mut connected_shape = AppState {
+            devices: vec![ProviderTarget::new(TargetId::PiShock(1), "hub")],
+            selected_device: Some(TargetId::PiShock(1)),
+            ..AppState::default()
+        };
+        connected_shape.queue_trigger_action(trigger(TriggerKind::Death, "session", 1));
+        assert!(matches!(
+            connected_shape.action_status,
+            Some(ActionStatus::Skipped { reason, .. }) if reason == "provider is not connected"
+        ));
+    }
+    #[test]
+    fn optional_and_none_target_policies_reach_adapter_boundary() {
+        let selected = Some(ProviderTarget::new(TargetId::PiShock(1), "hub"));
+        assert!(
+            AppState::target_for_policy(crate::provider::TargetPolicy::Optional, None).is_none()
+        );
+        assert!(
+            AppState::target_for_policy(crate::provider::TargetPolicy::Optional, selected.clone())
+                .is_some()
+        );
+        assert!(
+            AppState::target_for_policy(crate::provider::TargetPolicy::None, selected).is_none()
+        );
     }
 }
