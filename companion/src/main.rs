@@ -1,8 +1,11 @@
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 pub mod action;
 pub mod action_ui;
 pub mod app;
 pub mod bridge_listener;
 pub mod deadlock_path;
+pub mod logging;
 pub mod persistence;
 pub mod provider;
 pub mod version_check;
@@ -17,15 +20,6 @@ impl eframe::App for CompanionApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.flush_pending();
     }
-}
-
-fn init_logging() {
-    env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or("warn,companion=info"),
-    )
-    .format_timestamp_millis()
-    .format_module_path(true)
-    .init();
 }
 
 fn app_icon() -> egui::IconData {
@@ -44,7 +38,7 @@ fn app_icon() -> egui::IconData {
 }
 
 fn main() -> eframe::Result {
-    init_logging();
+    let log_store = logging::init_logging();
     log::info!(
         target: "companion",
         "process_start version={} os={} arch={}",
@@ -68,6 +62,7 @@ fn main() -> eframe::Result {
         Box::new(|creation_context| {
             Ok(Box::new(CompanionApp::load_with_context(
                 creation_context.egui_ctx.clone(),
+                log_store.clone(),
             )))
         }),
     );

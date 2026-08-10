@@ -44,9 +44,19 @@ steps:
     environment:
       CARGO_TARGET_DIR: companion/target/drone-windows
     commands:
-      - apt-get update && apt-get install -y --no-install-recommends gcc-mingw-w64-x86-64
+      - apt-get update && apt-get install -y --no-install-recommends gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64
       - rustup target add x86_64-pc-windows-gnu
       - cargo build --locked --release --target x86_64-pc-windows-gnu --manifest-path companion/Cargo.toml
+      - |
+        exe="companion/target/drone-windows/x86_64-pc-windows-gnu/release/companion.exe"
+        subsystem="$(x86_64-w64-mingw32-objdump -p "$exe" | sed -n '/^[[:space:]]*Subsystem[[:space:]]/p' | sed -n '1p')"
+        case "$subsystem" in
+          *"00000002"*"Windows GUI"*) ;;
+          *)
+            echo "companion.exe must use the Windows GUI subsystem; got: $subsystem"
+            exit 1
+            ;;
+        esac
       - mkdir -p dist
       - cp companion/target/drone-windows/x86_64-pc-windows-gnu/release/companion.exe "dist/deadlock-shock-${DRONE_TAG}-windows-x86_64.exe"
 

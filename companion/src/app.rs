@@ -11,6 +11,7 @@ use crate::bridge_listener::{
     LocalPlayerDeath, ModVersionObservation,
 };
 use crate::deadlock_path::{self, Detection, DetectionError};
+use crate::logging::{LogSnapshot, LogStore};
 use crate::persistence::{PersistedState, Persistence, default_state_path};
 use crate::provider::{
     ConnectedProvider, ProviderConnectionConfig, ProviderError, ProviderKind, ProviderSettings,
@@ -1776,12 +1777,22 @@ pub struct CompanionApp {
     menu_error: Option<String>,
     version_check: VersionCheckOwner,
     version_warnings: WarningSelection,
+    log_store: LogStore,
+    logs_window_open: bool,
+    logs_cached_revision: u64,
+    logs_cached_text: String,
 }
 
 impl CompanionApp {
     pub fn load() -> Self {
+        Self::load_with_store(LogStore::new())
+    }
+
+    fn load_with_store(log_store: LogStore) -> Self {
         match default_state_path() {
-            Ok(path) => Self::load_from_path(path),
+            Ok(path) => {
+                Self::load_from_path_with_detector_and_store(path, deadlock_path::detect, log_store)
+            }
             Err(error) => {
                 log::warn!(
                     target: "companion::app",
@@ -1789,13 +1800,13 @@ impl CompanionApp {
                     error
                 );
                 let (persistence, state) = Persistence::unavailable(error);
-                Self::from_persisted_state(persistence, state, deadlock_path::detect)
+                Self::from_persisted_state(persistence, state, deadlock_path::detect, log_store)
             }
         }
     }
 
-    pub fn load_with_context(context: egui::Context) -> Self {
-        let mut app = Self::load();
+    pub fn load_with_context(context: egui::Context, log_store: LogStore) -> Self {
+        let mut app = Self::load_with_store(log_store);
         app.version_check = VersionCheckOwner::new(&context);
         app
     }
@@ -1808,14 +1819,26 @@ impl CompanionApp {
     where
         F: FnOnce() -> Result<Detection, DetectionError>,
     {
+        Self::load_from_path_with_detector_and_store(path, detector, LogStore::new())
+    }
+
+    fn load_from_path_with_detector_and_store<F>(
+        path: PathBuf,
+        detector: F,
+        log_store: LogStore,
+    ) -> Self
+    where
+        F: FnOnce() -> Result<Detection, DetectionError>,
+    {
         let (persistence, state) = Persistence::open(path);
-        Self::from_persisted_state(persistence, state, detector)
+        Self::from_persisted_state(persistence, state, detector, log_store)
     }
 
     fn from_persisted_state<F>(
         persistence: Persistence,
         persisted_state: PersistedState,
         detector: F,
+        log_store: LogStore,
     ) -> Self
     where
         F: FnOnce() -> Result<Detection, DetectionError>,
@@ -1829,6 +1852,10 @@ impl CompanionApp {
             menu_error: None,
             version_check: VersionCheckOwner::with_client(LATEST_RELEASE_URL, None),
             version_warnings: WarningSelection::default(),
+            log_store,
+            logs_window_open: false,
+            logs_cached_revision: 0,
+            logs_cached_text: String::new(),
         }
     }
 
@@ -1860,6 +1887,7 @@ impl CompanionApp {
             });
         });
         self.draw_reset_confirmation(ui);
+        self.draw_logs_window(ui.ctx());
 
         if let Some(delay) = self
             .persistence
@@ -1870,6 +1898,39 @@ impl CompanionApp {
         if self.version_check.is_checking() {
             ui.ctx().request_repaint_after(Duration::from_millis(250));
         }
+    }
+    fn draw_logs_window(&mut self, ctx: &egui::Context) {
+        if !self.logs_window_open {
+            return;
+        }
+
+        let revision = self.log_store.revision();
+        if revision != self.logs_cached_revision {
+            let snapshot: LogSnapshot = self.log_store.snapshot();
+            self.logs_cached_revision = snapshot.revision;
+            self.logs_cached_text = snapshot.text;
+        }
+        ctx.request_repaint_after(Duration::from_millis(250));
+
+        let mut open = self.logs_window_open;
+        egui::Window::new("Logs").open(&mut open).show(ctx, |ui| {
+            if ui.button("Copy all").clicked() {
+                ctx.copy_text(self.logs_cached_text.clone());
+            }
+            if self.logs_cached_text.is_empty() {
+                ui.label("No log records have been captured yet.");
+                return;
+            }
+            egui::ScrollArea::vertical()
+                .stick_to_bottom(true)
+                .show(ui, |ui| {
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(&self.logs_cached_text).monospace())
+                            .selectable(true),
+                    );
+                });
+        });
+        self.logs_window_open = open;
     }
 
     fn draw_update_panel(&self, ui: &mut Ui) {
@@ -1967,6 +2028,10 @@ impl CompanionApp {
                             error
                         );
                     }
+                }
+                if ui.button("Show logs").clicked() {
+                    self.logs_window_open = true;
+                    ui.close();
                 }
                 ui.separator();
                 let response =
@@ -2178,8 +2243,10 @@ fn to_color(color: [f32; 4]) -> Color32 {
 mod tests {
     use super::*;
     use crate::action::{ResolvedShockAction, ShockActionSettings, ShockMode};
+    use crate::logging::CapturingWriter;
     use rand::SeedableRng;
     use rand::rngs::StdRng;
+    use std::io::Write;
 
     fn trigger(kind: TriggerKind, session_id: &str, sequence: u64) -> TriggerIdentity {
         TriggerIdentity {
@@ -2880,6 +2947,36 @@ mod tests {
             egui::CentralPanel::default().show(ctx, |ui| app.draw(ui));
         });
         assert!(!output.shapes.is_empty());
+    }
+    #[test]
+    fn injected_logs_render_and_reopen_without_persisted_state_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = LogStore::new();
+        let mut writer = CapturingWriter::new(store.clone(), Vec::<u8>::new());
+        writer.write_all(b"startup_record\nlive_record\n").unwrap();
+        let mut app = CompanionApp::load_from_path_with_detector_and_store(
+            directory.path().join("state.json"),
+            || Err(DetectionError::DeadlockNotInstalled),
+            store,
+        );
+        let persisted = PersistedState::from_app(&app.state);
+        let context = egui::Context::default();
+        app.logs_window_open = true;
+        let output = context.run_ui(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.draw(ui));
+        });
+        assert!(!output.shapes.is_empty());
+        assert!(app.logs_cached_text.contains("startup_record"));
+        assert!(app.logs_cached_text.contains("live_record"));
+        app.logs_window_open = false;
+        let _ = context.run_ui(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.draw(ui));
+        });
+        app.logs_window_open = true;
+        let _ = context.run_ui(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.draw(ui));
+        });
+        assert_eq!(PersistedState::from_app(&app.state), persisted);
     }
     #[test]
     fn completed_action_decrements_in_flight_and_records_sent_status() {
