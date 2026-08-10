@@ -40,7 +40,7 @@ In **Setup**, pick PiShock or OpenShock, enter the provider's typed setup values
 
 In **Effects**, configure Death, Ability use, and Cooldown ready independently. Each trigger has its own explicit provider action profile; the currently available providers expose the same fixed or random-interval shock editor. Ability-use and cooldown-ready also have independent positional-slot filters that apply across heroes; ability names appear when the addon reports them, with numbered slots as the fallback. Use the explicit Copy control to copy only the active action family between profiles without changing enablement or ability selection. Local-player death is enabled by default, while both ability triggers are opt-in. Cooldown ready covers both a normal cooldown finishing and a charged ability restoring a charge.
 
-In **Game connection**, auto-detect `console.log` or enter its path, start the listener, and review listener, bridge-event, and last-action diagnostics. Deadlock must run with `-condebug` so the log is written.
+In **Game connection**, the companion automatically resumes a saved `console.log` path or auto-detects Deadlock and starts the listener at launch. Use **Auto-detect** and **Start/Restart listener** for diagnostics, retry, or a manual path override. Deadlock must run with `-condebug` so the log is written.
 
 The companion remembers your setup—including both providers' setup values, all three action profiles, and ability filters—in your OS user config directory. Ability names are runtime diagnostics and are not saved.
 

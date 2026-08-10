@@ -139,6 +139,20 @@ impl LogDetectionStatus {
         }
     }
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LogListenerStartContext {
+    Manual,
+    Startup,
+}
+
+impl LogListenerStartContext {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::Startup => "startup",
+        }
+    }
+}
 
 type ConnectionResult = Result<(ConnectedProvider, Vec<ProviderTarget>), ProviderError>;
 type TestActionResult = Result<(), ProviderError>;
@@ -1153,6 +1167,40 @@ impl AppState {
         self.ensure_bridge_subscription();
         self.bridge_listener.start(path)
     }
+
+    fn start_listener_at(
+        &mut self,
+        path: PathBuf,
+        context: LogListenerStartContext,
+    ) -> std::io::Result<()> {
+        self.listener_action_error = None;
+        log::info!(
+            target: "companion::app",
+            "log_listener_start_requested context={} path={:?}",
+            context.label(),
+            path
+        );
+        let result = self.start_log_listener(path.clone());
+        match &result {
+            Ok(()) => log::info!(
+                target: "companion::app",
+                "log_listener_started context={} path={:?}",
+                context.label(),
+                path
+            ),
+            Err(error) => {
+                log::warn!(
+                    target: "companion::app",
+                    "log_listener_start_failed context={} path={:?} error={:?}",
+                    context.label(),
+                    path,
+                    error
+                );
+                self.listener_action_error = Some(format!("Could not start listener: {error}"));
+            }
+        }
+        result
+    }
     fn poll_bridge_events(&mut self) {
         while let Some(result) = self.bridge_events.as_ref().map(Receiver::try_recv) {
             match result {
@@ -1245,95 +1293,110 @@ impl AppState {
     }
 
     fn start_listener_from_input(&mut self) {
-        let path = self.log_path.trim();
-        if path.is_empty() {
-            log::warn!(target: "companion::app", "log_listener_start_skipped reason=empty_path");
-            self.listener_action_error =
-                Some("Enter a console.log path before starting the listener.".to_owned());
-            return;
-        }
-        let path = PathBuf::from(path);
-        log::info!(
-            target: "companion::app",
-            "log_listener_manual_start path={:?}",
-            path
-        );
-        self.listener_action_error = self.start_log_listener(path.clone()).err().map(|error| {
+        self.start_configured_listener(LogListenerStartContext::Manual);
+    }
+
+    fn start_configured_listener(&mut self, context: LogListenerStartContext) -> bool {
+        let trimmed_path = self.log_path.trim().to_owned();
+        if trimmed_path.is_empty() {
             log::warn!(
                 target: "companion::app",
-                "log_listener_manual_failed path={:?} error={:?}",
-                path,
-                error
+                "log_listener_start_skipped context={} reason=empty_path",
+                context.label()
             );
-            format!("Could not start listener: {error}")
-        });
-        if self.listener_action_error.is_none() {
+            self.listener_action_error =
+                Some("Enter a console.log path before starting the listener.".to_owned());
+            return false;
+        }
+        let path = PathBuf::from(trimmed_path);
+        self.start_listener_at(path, context).is_ok()
+    }
+
+    fn initialize_log_listener<F>(&mut self, detector: F)
+    where
+        F: FnOnce() -> Result<Detection, DetectionError>,
+    {
+        let trimmed_path = self.log_path.trim().to_owned();
+        if !trimmed_path.is_empty() {
+            self.log_path = trimmed_path;
             log::info!(
                 target: "companion::app",
-                "log_listener_manual_started path={:?}",
-                path
+                "log_listener_saved_path_selected context=startup path={:?}",
+                self.log_path
             );
+            self.start_configured_listener(LogListenerStartContext::Startup);
+            return;
         }
+
+        self.bridge_listener.stop();
+        self.listener_action_error = None;
+        log::info!(
+            target: "companion::app",
+            "log_path_auto_detection_started context=startup"
+        );
+        self.apply_log_detection_with_context(detector(), LogListenerStartContext::Startup);
     }
 
     fn auto_detect_log_path(&mut self) {
         self.listener_action_error = None;
-        log::info!(target: "companion::app", "log_path_auto_detection_started");
+        log::info!(
+            target: "companion::app",
+            "log_path_auto_detection_started context=manual"
+        );
         self.apply_log_detection(deadlock_path::detect());
     }
 
     fn apply_log_detection(&mut self, result: Result<Detection, DetectionError>) {
+        self.apply_log_detection_with_context(result, LogListenerStartContext::Manual);
+    }
+
+    fn apply_log_detection_with_context(
+        &mut self,
+        result: Result<Detection, DetectionError>,
+        context: LogListenerStartContext,
+    ) {
         match result {
             Ok(Detection::Ready { path }) => {
                 log::info!(
                     target: "companion::app",
-                    "log_path_auto_detection_found path={:?}",
+                    "log_path_auto_detection_found context={} path={:?}",
+                    context.label(),
                     path
                 );
                 self.log_path = path.display().to_string();
-                self.log_detection_status = match self.start_log_listener(path.clone()) {
+                self.log_detection_status = match self.start_listener_at(path, context) {
                     Ok(()) => Some(LogDetectionStatus::Found),
-                    Err(error) => {
-                        log::warn!(
-                            target: "companion::app",
-                            "log_listener_auto_start_failed path={:?} error={:?}",
-                            path,
-                            error
-                        );
-                        Some(LogDetectionStatus::Failed(format!(
-                            "Deadlock console.log was found, but the listener could not start: {error}"
-                        )))
-                    }
+                    Err(error) => Some(LogDetectionStatus::Failed(format!(
+                        "Deadlock console.log was found, but the listener could not start: {error}"
+                    ))),
                 };
             }
             Ok(Detection::NotCreated { path }) => {
                 log::info!(
                     target: "companion::app",
-                    "log_path_auto_detection_not_created path={:?}",
+                    "log_path_auto_detection_not_created context={} path={:?}",
+                    context.label(),
                     path
                 );
                 self.log_path = path.display().to_string();
-                self.log_detection_status = match self.start_log_listener(path.clone()) {
+                self.log_detection_status = match self.start_listener_at(path, context) {
                     Ok(()) => Some(LogDetectionStatus::NotCreated),
-                    Err(error) => {
-                        log::warn!(
-                            target: "companion::app",
-                            "log_listener_auto_start_failed path={:?} error={:?}",
-                            path,
-                            error
-                        );
-                        Some(LogDetectionStatus::Failed(format!(
-                            "Deadlock was found, but the listener could not start: {error}"
-                        )))
-                    }
+                    Err(error) => Some(LogDetectionStatus::Failed(format!(
+                        "Deadlock was found, but the listener could not start: {error}"
+                    ))),
                 };
             }
             Err(error) => {
                 log::warn!(
                     target: "companion::app",
-                    "log_path_auto_detection_failed error={:?}",
+                    "log_path_auto_detection_failed context={} error={:?}",
+                    context.label(),
                     error
                 );
+                if context == LogListenerStartContext::Startup {
+                    self.log_path.clear();
+                    self.bridge_listener.stop();
+                }
                 self.log_detection_status = Some(LogDetectionStatus::Failed(format!(
                     "Auto-detect failed: {error}"
                 )));
@@ -1726,14 +1789,7 @@ impl CompanionApp {
                     error
                 );
                 let (persistence, state) = Persistence::unavailable(error);
-                Self {
-                    state: state.restore_app(),
-                    persistence,
-                    reset_confirmation: false,
-                    menu_error: None,
-                    version_check: VersionCheckOwner::with_client(LATEST_RELEASE_URL, None),
-                    version_warnings: WarningSelection::default(),
-                }
+                Self::from_persisted_state(persistence, state, deadlock_path::detect)
             }
         }
     }
@@ -1745,9 +1801,29 @@ impl CompanionApp {
     }
 
     pub(crate) fn load_from_path(path: PathBuf) -> Self {
+        Self::load_from_path_with_detector(path, deadlock_path::detect)
+    }
+
+    fn load_from_path_with_detector<F>(path: PathBuf, detector: F) -> Self
+    where
+        F: FnOnce() -> Result<Detection, DetectionError>,
+    {
         let (persistence, state) = Persistence::open(path);
+        Self::from_persisted_state(persistence, state, detector)
+    }
+
+    fn from_persisted_state<F>(
+        persistence: Persistence,
+        persisted_state: PersistedState,
+        detector: F,
+    ) -> Self
+    where
+        F: FnOnce() -> Result<Detection, DetectionError>,
+    {
+        let mut state = persisted_state.restore_app();
+        state.initialize_log_listener(detector);
         Self {
-            state: state.restore_app(),
+            state,
             persistence,
             reset_confirmation: false,
             menu_error: None,
@@ -2414,6 +2490,160 @@ mod tests {
     }
 
     #[test]
+    fn manual_listener_restart_uses_configured_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("console.log");
+        std::fs::write(&path, b"").unwrap();
+        let mut state = AppState {
+            log_path: path.display().to_string(),
+            ..AppState::default()
+        };
+
+        state.start_listener_from_input();
+
+        let status = state.bridge_listener.status();
+        assert_eq!(status.configured_path, Some(path));
+        assert_eq!(status.phase, ListenerPhase::Listening);
+        assert!(state.bridge_events.is_some());
+        assert!(state.listener_action_error.is_none());
+    }
+
+    #[test]
+    fn startup_saved_path_starts_without_detection() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().join("state.json");
+        let log_path = directory.path().join("console.log");
+        std::fs::write(&log_path, b"").unwrap();
+        {
+            let mut first_launch =
+                CompanionApp::load_from_path_with_detector(state_path.clone(), || {
+                    Err(DetectionError::DeadlockNotInstalled)
+                });
+            first_launch.state.log_path = format!("  {}  ", log_path.display());
+            first_launch.flush_pending();
+            assert!(first_launch.persistence.save_error().is_none());
+        }
+
+        let app = CompanionApp::load_from_path_with_detector(
+            state_path,
+            || -> Result<Detection, DetectionError> {
+                panic!("saved path startup must not detect");
+            },
+        );
+
+        let status = app.state.bridge_listener.status();
+        assert_eq!(app.state.log_path, log_path.display().to_string());
+        assert!(app.state.bridge_events.is_some());
+        assert_eq!(status.configured_path, Some(log_path));
+        assert_eq!(status.phase, ListenerPhase::Listening);
+        assert!(app.state.listener_action_error.is_none());
+    }
+
+    #[test]
+    fn startup_saved_missing_path_waits_without_detection_or_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("console.log");
+        let mut state = AppState {
+            log_path: path.display().to_string(),
+            ..AppState::default()
+        };
+
+        state.initialize_log_listener(|| -> Result<Detection, DetectionError> {
+            panic!("saved path startup must not detect");
+        });
+
+        let status = state.bridge_listener.status();
+        assert_eq!(status.configured_path, Some(path));
+        assert_eq!(status.phase, ListenerPhase::WaitingForFile);
+        assert!(state.listener_action_error.is_none());
+    }
+
+    #[test]
+    fn startup_empty_state_ready_detection_starts_listener() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("console.log");
+        std::fs::write(&path, b"").unwrap();
+        let mut state = AppState::default();
+
+        state.initialize_log_listener(|| Ok(Detection::Ready { path: path.clone() }));
+
+        let status = state.bridge_listener.status();
+        assert_eq!(state.log_path, path.display().to_string());
+        assert_eq!(state.log_detection_status, Some(LogDetectionStatus::Found));
+        assert_eq!(status.configured_path, Some(path));
+        assert_eq!(status.phase, ListenerPhase::Listening);
+    }
+
+    #[test]
+    fn startup_empty_state_not_created_detection_waits_with_guidance() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("console.log");
+        let mut state = AppState::default();
+
+        state.initialize_log_listener(|| Ok(Detection::NotCreated { path: path.clone() }));
+
+        let status = state.bridge_listener.status();
+        assert_eq!(state.log_path, path.display().to_string());
+        assert_eq!(
+            state.log_detection_status,
+            Some(LogDetectionStatus::NotCreated)
+        );
+        assert!(
+            state
+                .log_detection_status
+                .as_ref()
+                .expect("not-created status")
+                .label()
+                .contains("-condebug")
+        );
+        assert_eq!(status.configured_path, Some(path));
+        assert_eq!(status.phase, ListenerPhase::WaitingForFile);
+    }
+
+    #[test]
+    fn startup_detection_failure_is_non_fatal_and_stays_stopped() {
+        let mut state = AppState::default();
+
+        state.initialize_log_listener(|| Err(DetectionError::DeadlockNotInstalled));
+
+        assert!(state.log_path.is_empty());
+        assert_eq!(state.bridge_listener.status().phase, ListenerPhase::Stopped);
+        assert!(state.bridge_events.is_none());
+        assert!(state.listener_action_error.is_none());
+        assert!(matches!(
+            state.log_detection_status,
+            Some(LogDetectionStatus::Failed(_))
+        ));
+    }
+
+    #[test]
+    fn startup_reset_stops_listener_without_second_detection() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().join("state.json");
+        let log_path = directory.path().join("console.log");
+        let detection_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let detector_calls = Arc::clone(&detection_calls);
+        let mut app = CompanionApp::load_from_path_with_detector(state_path, move || {
+            detector_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Detection::NotCreated {
+                path: log_path.clone(),
+            })
+        });
+
+        assert_eq!(detection_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            app.state.bridge_listener.status().phase,
+            ListenerPhase::WaitingForFile
+        );
+        assert!(app.reset_and_save());
+        assert_eq!(
+            app.state.bridge_listener.status().phase,
+            ListenerPhase::Stopped
+        );
+        assert_eq!(detection_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn expired_completion_is_skipped_and_decrements_in_flight() {
         let request = ActionRequest {
             provider: ProviderKind::PiShock,
@@ -2613,7 +2843,9 @@ mod tests {
     fn reset_clears_listener_runtime_and_writes_durable_defaults() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("state.json");
-        let mut app = CompanionApp::load_from_path(path.clone());
+        let mut app = CompanionApp::load_from_path_with_detector(path.clone(), || {
+            Err(DetectionError::DeadlockNotInstalled)
+        });
         app.state.provider = ProviderKind::OpenShock;
         app.state.provider_settings.openshock.token = "secret".to_owned();
         app.state.preferred_target = Some(TargetId::OpenShock("group".to_owned()));
@@ -2639,7 +2871,10 @@ mod tests {
     #[test]
     fn persistence_aware_app_renders_with_injected_state_path() {
         let directory = tempfile::tempdir().unwrap();
-        let mut app = CompanionApp::load_from_path(directory.path().join("state.json"));
+        let mut app =
+            CompanionApp::load_from_path_with_detector(directory.path().join("state.json"), || {
+                Err(DetectionError::DeadlockNotInstalled)
+            });
         let context = egui::Context::default();
         let output = context.run_ui(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| app.draw(ui));
