@@ -1464,12 +1464,7 @@ impl AppState {
                     &mut self.provider_settings.pishock.api_key,
                     true,
                 );
-                credentials_changed |= text_input(
-                    ui,
-                    "Username",
-                    &mut self.provider_settings.pishock.username,
-                    false,
-                );
+                ui.label(descriptor.setup_help);
             }
             ProviderKind::OpenShock => {
                 credentials_changed |= text_input(
@@ -2272,13 +2267,11 @@ mod tests {
     #[test]
     fn provider_setup_retention_uses_only_typed_banks() {
         let mut state = AppState::default();
-        state.provider_settings.pishock.username = "user".into();
         state.provider_settings.pishock.api_key = "key".into();
         state.set_provider(ProviderKind::OpenShock);
         state.provider_settings.openshock.token = "token".into();
         assert!(state.credentials_present());
         state.set_provider(ProviderKind::PiShock);
-        assert_eq!(state.provider_settings.pishock.username, "user");
         assert_eq!(state.provider_settings.pishock.api_key, "key");
         assert_eq!(state.provider_settings.openshock.token, "token");
     }
@@ -2884,8 +2877,7 @@ mod tests {
         let mut connection_busy = AppState {
             provider_settings: ProviderSettings {
                 pishock: crate::provider::PiShockSetup {
-                    username: "keep".to_owned(),
-                    ..Default::default()
+                    api_key: "keep".to_owned(),
                 },
                 ..Default::default()
             },
@@ -2894,7 +2886,7 @@ mod tests {
         let (_sender, receiver) = mpsc::channel();
         connection_busy.connection_result = Some(receiver);
         assert!(!connection_busy.reset_saved_state());
-        assert_eq!(connection_busy.provider_settings.pishock.username, "keep");
+        assert_eq!(connection_busy.provider_settings.pishock.api_key, "keep");
         let mut test_busy = AppState::default();
         let (_sender, receiver) = mpsc::channel();
         test_busy.test_action_result = Some(receiver);

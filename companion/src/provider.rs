@@ -5,7 +5,7 @@ use crate::action::{ActionKind, ResolvedAction};
 use openshock::{
     Credentials as OpenShockCredentials, DeviceGroup, Error as OpenShockError, OpenShockClient,
 };
-use pishock::{Credentials as PiShockCredentials, Device, Error as PiShockError, WebSocketClient};
+use pishock::{DeviceGroup as PiShockDeviceGroup, Error as PiShockError, HttpClient};
 use thiserror::Error;
 
 pub const SENDER_NAME: &str = "deadlockshock-companion";
@@ -24,8 +24,8 @@ impl ProviderKind {
                 kind: self,
                 label: "PiShock",
                 setup_label: "PiShock setup",
-                setup_help: "PiShock account username and API key.",
-                setup_kind: SetupKind::UserAndSecret,
+                setup_help: "PiShock API key. Claim a share code for each shocker, including your own.",
+                setup_kind: SetupKind::Secret,
                 target_noun: "Device group",
                 target_policy: TargetPolicy::Required,
                 test_action: Some(TestActionKind::Sound),
@@ -102,13 +102,11 @@ pub const SUPPORTED_PROVIDERS: [ProviderKind; 2] = [ProviderKind::PiShock, Provi
 
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct PiShockSetup {
-    pub username: String,
     pub api_key: String,
 }
 impl fmt::Debug for PiShockSetup {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PiShockSetup")
-            .field("username", &self.username)
             .field("api_key", &"[REDACTED]")
             .finish()
     }
@@ -116,12 +114,11 @@ impl fmt::Debug for PiShockSetup {
 impl PiShockSetup {
     pub fn normalized(&self) -> Self {
         Self {
-            username: self.username.trim().to_owned(),
             api_key: self.api_key.trim().to_owned(),
         }
     }
     pub fn present(&self) -> bool {
-        !self.username.trim().is_empty() && !self.api_key.trim().is_empty()
+        !self.api_key.trim().is_empty()
     }
 }
 #[derive(Clone, Default, PartialEq, Eq)]
@@ -208,7 +205,7 @@ pub enum TargetId {
 }
 #[derive(Clone)]
 enum TargetData {
-    PiShock(Device),
+    PiShock(PiShockDeviceGroup),
     OpenShock(DeviceGroup),
 }
 #[derive(Clone)]
@@ -269,7 +266,7 @@ pub enum ProviderError {
 }
 
 pub enum ConnectedProvider {
-    PiShock(WebSocketClient),
+    PiShock(HttpClient),
     OpenShock(OpenShockClient),
     #[cfg(test)]
     Test(ProviderKind),
@@ -294,8 +291,8 @@ impl ConnectedProvider {
             (ProviderKind::PiShock, ProviderConnectionConfig::PiShock(setup))
                 if setup.present() =>
             {
-                Ok(Self::PiShock(WebSocketClient::connect(
-                    PiShockCredentials::new(setup.username.trim(), setup.api_key.trim()),
+                Ok(Self::PiShock(HttpClient::connect(
+                    setup.api_key.trim(),
                     SENDER_NAME,
                 )?))
             }
@@ -342,7 +339,7 @@ impl ConnectedProvider {
                 self.validate_target(target)?;
                 match target.data.as_ref() {
                     Some(TargetData::PiShock(device)) => {
-                        client.beep_device(device, TEST_SOUND_DURATION.as_secs() as u8)?;
+                        client.beep_device(device, TEST_SOUND_DURATION.as_millis() as u64)?;
                         Ok(())
                     }
                     Some(TargetData::OpenShock(_)) => Err(ProviderError::TargetProviderMismatch),
@@ -437,7 +434,7 @@ fn target_matches(provider: ProviderKind, target: &TargetId) -> bool {
             | (ProviderKind::OpenShock, TargetId::OpenShock(_))
     )
 }
-fn target_from_pishock(device: Device) -> ProviderTarget {
+fn target_from_pishock(device: PiShockDeviceGroup) -> ProviderTarget {
     ProviderTarget {
         id: TargetId::PiShock(device.client_id),
         name: device.name.clone(),
@@ -460,12 +457,26 @@ mod tests {
         assert_eq!(ProviderKind::default(), ProviderKind::PiShock);
     }
     #[test]
+    fn pishock_setup_requires_only_an_api_key() {
+        let setup = PiShockSetup {
+            api_key: " \tkey\n".into(),
+        };
+        assert!(setup.present());
+        assert_eq!(setup.normalized().api_key, "key");
+        assert!(!PiShockSetup {
+            api_key: " \t".into(),
+        }.present());
+        assert_eq!(
+            ProviderKind::PiShock.descriptor().setup_kind,
+            SetupKind::Secret
+        );
+    }
+    #[test]
     fn setup_debug_redacts_secrets() {
         const PISHOCK_SECRET: &str = "pishock-secret-value";
         const OPENSHOCK_SECRET: &str = "openshock-secret-value";
         let setup = ProviderSettings {
             pishock: PiShockSetup {
-                username: "u".into(),
                 api_key: PISHOCK_SECRET.into(),
             },
             openshock: OpenShockSetup {

@@ -17,7 +17,7 @@ use crate::app::{
 };
 use crate::provider::{OpenShockSetup, PiShockSetup, ProviderKind, ProviderSettings, TargetId};
 
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 5;
 pub const SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -33,11 +33,22 @@ pub(crate) struct PersistedState {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct PersistedStateV4 {
+    #[serde(rename = "schema_version")]
+    _schema_version: u32,
+    provider: PersistedProvider,
+    provider_settings: PersistedProviderSettingsV4,
+    preferred_target: Option<PersistedTarget>,
+    triggers: PersistedTriggers,
+    log_path: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PersistedStateV3 {
     #[serde(rename = "schema_version")]
     _schema_version: u32,
     provider: PersistedProvider,
-    credentials: PersistedProviderSettings,
+    credentials: PersistedProviderSettingsV4,
     preferred_target: Option<PersistedTarget>,
     triggers: PersistedTriggersV3,
     log_path: String,
@@ -48,7 +59,7 @@ struct PersistedStateV2 {
     #[serde(rename = "schema_version")]
     _schema_version: u32,
     provider: PersistedProvider,
-    credentials: PersistedProviderSettings,
+    credentials: PersistedProviderSettingsV4,
     preferred_target: Option<PersistedTarget>,
     shock: PersistedShock,
     triggers: PersistedTriggersV2,
@@ -60,7 +71,7 @@ struct PersistedStateV1 {
     #[serde(rename = "schema_version")]
     _schema_version: u32,
     provider: PersistedProvider,
-    credentials: PersistedProviderSettings,
+    credentials: PersistedProviderSettingsV4,
     preferred_target: Option<PersistedTarget>,
     shock: PersistedShock,
     log_path: String,
@@ -167,8 +178,30 @@ struct PersistedProviderSettings {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PersistedPiShockSetup {
-    username: String,
     api_key: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedProviderSettingsV4 {
+    pishock: PersistedPiShockSetupV4,
+    openshock: PersistedOpenShockSetup,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedPiShockSetupV4 {
+    #[serde(rename = "username")]
+    _username: String,
+    api_key: String,
+}
+impl From<PersistedProviderSettingsV4> for PersistedProviderSettings {
+    fn from(settings: PersistedProviderSettingsV4) -> Self {
+        Self {
+            pishock: PersistedPiShockSetup {
+                api_key: settings.pishock.api_key,
+            },
+            openshock: settings.openshock,
+        }
+    }
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -261,7 +294,6 @@ impl Default for PersistedProviderSettings {
     fn default() -> Self {
         Self {
             pishock: PersistedPiShockSetup {
-                username: String::new(),
                 api_key: String::new(),
             },
             openshock: PersistedOpenShockSetup {
@@ -343,7 +375,7 @@ impl From<PersistedStateV1> for PersistedState {
         Self {
             schema_version: SCHEMA_VERSION,
             provider: state.provider,
-            provider_settings: state.credentials,
+            provider_settings: state.credentials.into(),
             preferred_target: state.preferred_target,
             triggers: PersistedTriggers::from_shared(state.shock, PersistedTriggersV2::default()),
             log_path: state.log_path,
@@ -355,7 +387,7 @@ impl From<PersistedStateV2> for PersistedState {
         Self {
             schema_version: SCHEMA_VERSION,
             provider: state.provider,
-            provider_settings: state.credentials,
+            provider_settings: state.credentials.into(),
             preferred_target: state.preferred_target,
             triggers: PersistedTriggers::from_shared(state.shock, state.triggers),
             log_path: state.log_path,
@@ -367,9 +399,22 @@ impl From<PersistedStateV3> for PersistedState {
         Self {
             schema_version: SCHEMA_VERSION,
             provider: state.provider,
-            provider_settings: state.credentials,
+            provider_settings: state.credentials.into(),
             preferred_target: state.preferred_target,
             triggers: PersistedTriggers::from_v3(state.triggers),
+            log_path: state.log_path,
+        }
+    }
+}
+
+impl From<PersistedStateV4> for PersistedState {
+    fn from(state: PersistedStateV4) -> Self {
+        Self {
+            schema_version: SCHEMA_VERSION,
+            provider: state.provider,
+            provider_settings: state.provider_settings.into(),
+            preferred_target: state.preferred_target,
+            triggers: state.triggers,
             log_path: state.log_path,
         }
     }
@@ -383,7 +428,6 @@ impl PersistedState {
             provider: app.provider.into(),
             provider_settings: PersistedProviderSettings {
                 pishock: PersistedPiShockSetup {
-                    username: setup.pishock.username,
                     api_key: setup.pishock.api_key,
                 },
                 openshock: PersistedOpenShockSetup {
@@ -404,7 +448,6 @@ impl PersistedState {
         app.provider = self.provider.into();
         app.provider_settings = ProviderSettings {
             pishock: PiShockSetup {
-                username: self.provider_settings.pishock.username.clone(),
                 api_key: self.provider_settings.pishock.api_key.clone(),
             },
             openshock: OpenShockSetup {
@@ -735,11 +778,14 @@ pub(crate) fn load_from_path(path: &Path) -> LoadOutcome {
             3 => serde_json::from_str::<PersistedStateV3>(&source)
                 .map(|state| (PersistedState::from(state), true))
                 .map_err(|error| error.to_string()),
+            4 => serde_json::from_str::<PersistedStateV4>(&source)
+                .map(|state| (PersistedState::from(state), true))
+                .map_err(|error| error.to_string()),
             SCHEMA_VERSION => serde_json::from_str::<PersistedState>(&source)
                 .map(|state| (state, false))
                 .map_err(|error| error.to_string()),
             unsupported => Err(format!(
-                "unsupported schema version {unsupported}; expected 1, 2, 3, or {SCHEMA_VERSION}"
+                "unsupported schema version {unsupported}; expected 1, 2, 3, 4, or {SCHEMA_VERSION}"
             )),
         })
         .and_then(|(state, migrated)| state.normalized().map(|state| (state, migrated)));
@@ -1213,10 +1259,9 @@ mod tests {
     }
 
     #[test]
-    fn schema_four_round_trip_preserves_provider_and_action_banks() {
+    fn schema_five_round_trip_preserves_provider_and_action_banks() {
         let mut app = AppState::default();
         app.provider = ProviderKind::OpenShock;
-        app.provider_settings.pishock.username = "pi-user".into();
         app.provider_settings.pishock.api_key = "pi-key".into();
         app.provider_settings.openshock.token = "open-token".into();
         app.preferred_target = Some(TargetId::OpenShock("group-id".into()));
@@ -1241,6 +1286,40 @@ mod tests {
             restored.triggers.ability_use.ability_filter,
             app.triggers.ability_use.ability_filter
         );
+    }
+
+    #[test]
+    fn schema_four_migration_retains_key_and_settings_and_discards_obsolete_username() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.json");
+        let mut app = AppState::default();
+        app.provider_settings.pishock.api_key = "retained-key".into();
+        app.provider_settings.openshock.token = "retained-token".into();
+        app.preferred_target = Some(TargetId::PiShock(7));
+        app.triggers.ability_use.trigger.enabled = true;
+        app.triggers.ability_use.ability_filter = AbilityFilter::Selected(BTreeSet::from([2, 4]));
+        app.triggers.death.actions.shock.fixed.intensity = 45.0;
+        app.log_path = "/retained/console.log".into();
+        let expected = PersistedState::from_app(&app);
+        let mut legacy = serde_json::to_value(&expected).unwrap();
+        legacy["schema_version"] = serde_json::json!(4);
+        legacy["provider_settings"]["pishock"]["username"] = serde_json::json!("obsolete-user");
+        fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let outcome = load_from_path(&path);
+        assert!(outcome.warning.is_none());
+        assert!(outcome.migrated);
+        assert_eq!(outcome.state, expected);
+        assert!(outcome.state.restore_app().credentials_present());
+        let (mut persistence, migrated) = Persistence::open(path.clone());
+        persistence.flush(migrated).unwrap();
+        let rewritten: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(rewritten["schema_version"], SCHEMA_VERSION);
+        assert_eq!(
+            rewritten["provider_settings"]["pishock"],
+            serde_json::json!({"api_key":"retained-key"})
+        );
+        assert!(!load_from_path(&path).migrated);
     }
 
     #[test]
@@ -1359,10 +1438,9 @@ mod tests {
         );
     }
     #[test]
-    fn schema_four_round_trip_preserves_all_setup_profiles_targets_filters_and_actions() {
+    fn schema_five_round_trip_preserves_all_setup_profiles_targets_filters_and_actions() {
         let mut original = AppState::default();
         original.provider = ProviderKind::OpenShock;
-        original.provider_settings.pishock.username = "pi-user".to_owned();
         original.provider_settings.pishock.api_key = "pi-key".to_owned();
         original.provider_settings.openshock.token = "open-token".to_owned();
         original.preferred_target = Some(TargetId::OpenShock("group-id".to_owned()));
@@ -1450,7 +1528,7 @@ mod tests {
         assert!(outcome.warning.is_none());
         let restored = outcome.state.restore_app();
         assert_eq!(restored.provider, ProviderKind::OpenShock);
-        assert_eq!(restored.provider_settings.pishock.username, "pi-user");
+        assert_eq!(restored.provider_settings.pishock.api_key, "pi-key");
         assert_eq!(restored.provider_settings.openshock.token, "open-token");
         assert_eq!(
             restored.preferred_target,

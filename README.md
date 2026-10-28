@@ -38,6 +38,8 @@ cargo run --manifest-path companion/Cargo.toml --release
 
 In **Setup**, pick PiShock or OpenShock, enter the provider's typed setup values, test the connection, select a device group when the provider requires one, and try the test sound.
 
+PiShock uses only an API key with the [public HTTP API](https://api.pishock.com/swagger/index.html); no username is required. Device groups include your own hubs and hubs shared with your account. Its command API requires V3 firmware and a claimed share code for each shocker, including ones you own. Create and claim those shares on PiShock before connecting the companion. Existing saved API keys and device-group selections are retained when upgrading. Commands use milliseconds and the permissions of a specific share; multiple shares of one shocker do not send duplicate commands.
+
 In **Effects**, configure Death, Ability use, and Cooldown ready independently. Each trigger has its own explicit provider action profile; the currently available providers expose the same fixed or random-interval shock editor. Ability-use and cooldown-ready also have independent positional-slot filters that apply across heroes; ability names appear when the addon reports them, with numbered slots as the fallback. Use the explicit Copy control to copy only the active action family between profiles without changing enablement or ability selection. Local-player death is enabled by default, while both ability triggers are opt-in. Cooldown ready covers both a normal cooldown finishing and a charged ability restoring a charge.
 
 In **Game connection**, the companion automatically resumes a saved `console.log` path or auto-detects Deadlock and starts the listener at launch. Use **Auto-detect** and **Start/Restart listener** for diagnostics, retry, or a manual path override. Deadlock must run with `-condebug` so the log is written.
@@ -49,7 +51,7 @@ The companion remembers your setup—including both providers' setup values, all
 
 The companion uses exhaustive built-in provider descriptors and typed extension points. `src/provider.rs` owns provider setup snapshots, target policy, optional typed test-action capabilities, connected blocking clients, tagged targets, test operations, execution, disconnect, and redacted errors. `src/action.rs` owns action families, validation, immutable resolution, safe summaries, and persistence-facing settings banks; `src/action_ui.rs` contains explicit egui editors. Event acceptance resolves an action before a bounded worker queue, so later UI edits cannot change queued work and provider calls never run on the egui thread. Optional and no-target policies pass `None` through orchestration; required adapters reject it before library calls.
 
-Saved state is strict schema 4 JSON. Schema 1, 2, and 3 states migrate losslessly into provider setup and per-trigger action banks while preserving selected provider, preferred target, filters, enablement, and log path. Available PiShock/OpenShock behavior remains shock-specific and uses the same portable bounds and at-most-once queue semantics.
+Saved state is strict schema 5 JSON. Schema 1 through 4 states migrate into provider setup and per-trigger action banks while preserving API keys, selected provider, preferred target, filters, enablement, and log path. The obsolete PiShock username is discarded. Available PiShock/OpenShock behavior remains shock-specific and uses the same portable bounds and at-most-once queue semantics.
 
 ## Publishing a release
 
