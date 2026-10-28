@@ -19,7 +19,7 @@ steps:
           }
         '
 
-  - name: bridge-version-preflight
+  - name: bridge-compatibility-preflight
     image: oven/bun:1
     commands:
       - bun test tests/death_http_bridge.test.js

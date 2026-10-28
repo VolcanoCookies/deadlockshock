@@ -1,5 +1,6 @@
 use std::cmp::Ordering;
 use std::io::Read;
+use std::sync::OnceLock;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::Duration;
@@ -7,7 +8,7 @@ use std::time::Duration;
 use crate::bridge_listener::ModVersionObservation;
 use egui::Context;
 use reqwest::blocking::{Client, Response};
-use semver::Version;
+use semver::{Version, VersionReq};
 use serde::Deserialize;
 
 pub const LATEST_RELEASE_URL: &str =
@@ -120,6 +121,23 @@ pub fn app_version() -> Version {
     Version::parse(env!("CARGO_PKG_VERSION")).expect("Cargo package version must be valid semver")
 }
 
+/// The same declaration is checked against the mod's output by release tests.
+pub fn supported_mod_versions() -> &'static VersionReq {
+    static SUPPORTED: OnceLock<VersionReq> = OnceLock::new();
+    SUPPORTED.get_or_init(|| {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct ModCompatibility {
+            supported_mod_versions: String,
+        }
+        let declaration: ModCompatibility =
+            serde_json::from_str(include_str!("../mod-compatibility.json"))
+                .expect("mod compatibility declaration must be valid JSON");
+        VersionReq::parse(&declaration.supported_mod_versions)
+            .expect("supported mod versions must be a valid semver requirement")
+    })
+}
+
 fn precedence_cmp(left: &Version, right: &Version) -> Ordering {
     left.cmp_precedence(right)
 }
@@ -130,9 +148,8 @@ fn is_older(left: &Version, right: &Version) -> bool {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct WarningSelection {
-    pub target: Option<Version>,
     pub companion_outdated: Option<Version>,
-    pub mod_outdated: Option<(Version, Version)>,
+    pub mod_unsupported: Option<Version>,
     pub mod_legacy: bool,
     pub mod_invalid: bool,
 }
@@ -146,25 +163,11 @@ pub fn select_warnings(
         ModVersionObservation::Reported(version) => Version::parse(version).ok(),
         _ => None,
     };
-    let target = [Some(app), observed.as_ref(), remote]
-        .into_iter()
-        .flatten()
-        .max_by(|left, right| precedence_cmp(left, right))
-        .cloned();
-    let companion_outdated = target
-        .as_ref()
-        .filter(|target| is_older(app, target))
-        .cloned();
-    let mod_outdated = observed.as_ref().and_then(|version| {
-        target
-            .as_ref()
-            .filter(|target| is_older(version, target))
-            .map(|target| (version.clone(), target.clone()))
-    });
+    let companion_outdated = remote.filter(|latest| is_older(app, latest)).cloned();
+    let mod_unsupported = observed.filter(|version| !supported_mod_versions().matches(version));
     WarningSelection {
-        target,
         companion_outdated,
-        mod_outdated,
+        mod_unsupported,
         mod_legacy: matches!(mod_observation, ModVersionObservation::Legacy),
         mod_invalid: matches!(mod_observation, ModVersionObservation::Invalid)
             || matches!(mod_observation, ModVersionObservation::Reported(version) if Version::parse(version).is_err()),
@@ -336,34 +339,46 @@ mod tests {
     }
 
     #[test]
-    fn warning_selection_uses_newest_known_precedence() {
-        let app_010 = version("0.1.0");
-        let app_020 = version("0.2.0");
-        let mod_010 = ModVersionObservation::Reported("0.1.0".to_owned());
-        let mod_020 = ModVersionObservation::Reported("0.2.0".to_owned());
+    fn declared_mod_range_accepts_compatible_stable_versions() {
+        let supported = supported_mod_versions();
+        for compatible in ["0.1.0", "0.1.9", "0.1.42", "0.1.0+build.2"] {
+            assert!(supported.matches(&version(compatible)), "{compatible}");
+        }
+        for unsupported in ["0.0.9", "0.2.0", "1.0.0", "0.1.1-alpha"] {
+            assert!(!supported.matches(&version(unsupported)), "{unsupported}");
+        }
+    }
 
-        let both_old = select_warnings(&app_010, &mod_010, Some(&version("0.2.0")));
-        assert_eq!(both_old.companion_outdated, Some(version("0.2.0")));
-        assert_eq!(
-            both_old.mod_outdated,
-            Some((version("0.1.0"), version("0.2.0")))
-        );
+    #[test]
+    fn companion_releases_do_not_make_a_supported_mod_outdated() {
+        let installed_mod = ModVersionObservation::Reported("0.1.0".to_owned());
+        let older_companion =
+            select_warnings(&version("0.1.0"), &installed_mod, Some(&version("0.2.0")));
+        assert_eq!(older_companion.companion_outdated, Some(version("0.2.0")));
+        assert!(older_companion.mod_unsupported.is_none());
 
-        let mod_old = select_warnings(&app_020, &mod_010, None);
-        assert!(mod_old.companion_outdated.is_none());
-        assert!(mod_old.mod_outdated.is_some());
+        for companion in ["0.1.1", "0.2.0", "2.0.0"] {
+            let current = version(companion);
+            let warnings = select_warnings(&current, &installed_mod, Some(&current));
+            assert_eq!(warnings, WarningSelection::default());
+        }
 
-        let app_old = select_warnings(&app_010, &mod_020, None);
-        assert!(app_old.companion_outdated.is_some());
-        assert!(app_old.mod_outdated.is_none());
+        let offline = select_warnings(&version("0.2.0"), &installed_mod, None);
+        assert_eq!(offline, WarningSelection::default());
+    }
 
-        let equal = select_warnings(&app_020, &mod_020, Some(&version("0.2.0")));
-        assert!(equal.companion_outdated.is_none());
-        assert!(equal.mod_outdated.is_none());
-
-        let local_newer = select_warnings(&version("0.3.0"), &mod_020, Some(&version("0.2.0")));
-        assert!(local_newer.companion_outdated.is_none());
-        assert!(local_newer.mod_outdated.is_some());
+    #[test]
+    fn unsupported_mods_do_not_invent_a_companion_release() {
+        for installed in ["0.0.9", "0.2.0", "1.0.0"] {
+            let observation = ModVersionObservation::Reported(installed.to_owned());
+            let warnings = select_warnings(&version("0.1.0"), &observation, None);
+            assert_eq!(warnings.mod_unsupported, Some(version(installed)));
+            assert!(warnings.companion_outdated.is_none());
+        }
+        let future_mod = ModVersionObservation::Reported("5.0.0".to_owned());
+        let warnings = select_warnings(&version("0.1.0"), &future_mod, Some(&version("0.2.0")));
+        assert_eq!(warnings.companion_outdated, Some(version("0.2.0")));
+        assert_eq!(warnings.mod_unsupported, Some(version("5.0.0")));
     }
 
     #[test]
@@ -377,24 +392,28 @@ mod tests {
 
         let build_only = select_warnings(
             &version("1.0.0+app"),
-            &ModVersionObservation::Reported("1.0.0+mod".to_owned()),
+            &ModVersionObservation::Reported("0.1.0+mod".to_owned()),
             Some(&version("1.0.0+release")),
         );
-        assert!(build_only.companion_outdated.is_none());
-        assert!(build_only.mod_outdated.is_none());
+        assert_eq!(build_only, WarningSelection::default());
 
         let legacy = select_warnings(&version("1.0.0"), &ModVersionObservation::Legacy, None);
         assert!(legacy.mod_legacy);
         assert!(!legacy.mod_invalid);
+        assert!(legacy.mod_unsupported.is_none());
 
-        let invalid = select_warnings(&version("1.0.0"), &ModVersionObservation::Invalid, None);
-        assert!(invalid.mod_invalid);
-        assert!(!invalid.mod_legacy);
+        for observation in [
+            ModVersionObservation::Invalid,
+            ModVersionObservation::Reported("invalid".to_owned()),
+        ] {
+            let invalid = select_warnings(&version("1.0.0"), &observation, None);
+            assert!(invalid.mod_invalid);
+            assert!(!invalid.mod_legacy);
+            assert!(invalid.mod_unsupported.is_none());
+        }
 
         let unknown = select_warnings(&version("1.0.0"), &ModVersionObservation::Unknown, None);
-        assert!(!unknown.mod_legacy);
-        assert!(!unknown.mod_invalid);
-        assert!(unknown.mod_outdated.is_none());
+        assert_eq!(unknown, WarningSelection::default());
     }
 
     #[test]

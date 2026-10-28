@@ -227,13 +227,16 @@ afterEach(() => {
 });
 
 describe("death_http_bridge", () => {
-    test("emitted mod version matches the companion Cargo package version", async () => {
-        const cargo = Bun.TOML.parse(await Bun.file("companion/Cargo.toml").text());
+    test("emitted mod version is supported by the companion compatibility declaration", async () => {
+        const compatibility = await Bun.file("companion/mod-compatibility.json").json();
         const harness = createHarness();
 
-        expect(new Set(harness.events().map((event) => event.mod_version))).toEqual(
-            new Set([cargo.package.version]),
-        );
+        expect(typeof compatibility.supported_mod_versions).toBe("string");
+        const versions = new Set(harness.events().map((event) => event.mod_version));
+        expect(versions.size).toBe(1);
+        for (const version of versions) {
+            expect(Bun.semver.satisfies(version, compatibility.supported_mod_versions)).toBe(true);
+        }
     });
     test("emits ready and the initial meaningful schema-1 ability catalogue", () => {
         const harness = createHarness();

@@ -55,16 +55,16 @@ Saved state is strict schema 5 JSON. Schema 1 through 4 states migrate into prov
 
 ## Publishing a release
 
-DeadlockShock uses one lockstep Semantic Version for the companion, Panorama mod, Git tag, and GameBanana listing. Before publishing:
+The companion and Panorama mod are versioned independently. The Git release tag matches the companion's Cargo version. `companion/mod-compatibility.json` declares the mod versions supported by that companion; its current range, `^0.1.0`, accepts stable mod versions from `0.1.0` up to but excluding `0.2.0`. This declaration is embedded in the companion for compatibility warnings and read by the release tests.
 
-1. Choose the release version and update `companion/Cargo.toml` plus `MOD_VERSION` in `mod/panorama/scripts/death_http_bridge.js` together.
-2. Run `bun test tests/death_http_bridge.test.js` and the affected companion tests; the bridge test verifies the cross-component version invariant.
-3. Build and smoke-test the VPK separately on Windows, then publish the mod on [GameBanana](https://gamebanana.com/mods/700758) with the same version.
-4. Push the matching tag only after the mod artifact/version is available:
+1. Choose the companion release version and update `companion/Cargo.toml` and its lockfile. Review the declared mod compatibility range; companion-only changes can retain the existing range and mod version.
+2. Run `bun test tests/death_http_bridge.test.js` and the affected companion tests. The bridge test checks that the emitted mod version falls within the companion's supported range, without requiring matching release versions.
+3. Only when the mod itself changes, update `MOD_VERSION` in `mod/panorama/scripts/death_http_bridge.js`, build and smoke-test the VPK separately on Windows, and publish it on [GameBanana](https://gamebanana.com/mods/700758) under its own version. Companion-only releases require no VPK rebuild or mod update.
+4. Push the tag matching the tested companion version:
 
 ```sh
 git tag v<version>
 git push origin v<version>
 ```
 
-Drone verifies `DRONE_TAG == v<companion Cargo version>` and the emitted mod metadata before building companion artifacts. The current pipeline does not build or upload the VPK; do not claim a tagged release contains the addon unless it was built and verified separately.
+Drone verifies `DRONE_TAG == v<companion Cargo version>` and the mod compatibility declaration before building companion artifacts. A newer companion release does not make a supported mod outdated. Missing or unsupported mod versions produce informational notices; gameplay-event parsing continues to require the supported log schema. The current pipeline does not build or upload the VPK; do not claim a tagged release contains the addon unless it was built and verified separately.
