@@ -19,7 +19,7 @@ use crate::provider::{
 };
 use crate::version_check::{
     COMPANION_RELEASE_URL, LATEST_RELEASE_URL, MOD_RELEASE_URL, VersionCheckOwner,
-    VersionCheckState, WarningSelection, app_version, select_warnings,
+    VersionCheckState, WarningSelection, app_version, select_warnings, supported_mod_versions,
 };
 use egui::{Color32, TextEdit, Ui};
 
@@ -1930,7 +1930,7 @@ impl CompanionApp {
 
     fn draw_update_panel(&self, ui: &mut Ui) {
         let has_warning = self.version_warnings.companion_outdated.is_some()
-            || self.version_warnings.mod_outdated.is_some()
+            || self.version_warnings.mod_unsupported.is_some()
             || self.version_warnings.mod_legacy
             || self.version_warnings.mod_invalid;
         if !has_warning {
@@ -1940,7 +1940,7 @@ impl CompanionApp {
             .fill(Color32::from_rgb(86, 64, 22))
             .inner_margin(8.0)
             .show(ui, |ui| {
-                ui.strong("Updates available");
+                ui.strong("Version notices");
                 if let Some(target) = &self.version_warnings.companion_outdated {
                     ui.horizontal(|ui| {
                         ui.label(format!(
@@ -1951,22 +1951,22 @@ impl CompanionApp {
                         ui.hyperlink_to("Download companion", COMPANION_RELEASE_URL);
                     });
                 }
-                if let Some((installed, target)) = &self.version_warnings.mod_outdated {
+                if let Some(installed) = &self.version_warnings.mod_unsupported {
                     ui.horizontal(|ui| {
                         ui.label(format!(
-                            "DeadlockShock mod {} is older than {}.",
-                            installed, target
+                            "DeadlockShock mod {} is outside this companion's supported range ({}).",
+                            installed, supported_mod_versions()
                         ));
-                        ui.hyperlink_to("Update mod", MOD_RELEASE_URL);
+                        ui.hyperlink_to("Mod downloads", MOD_RELEASE_URL);
                     });
                 } else if self.version_warnings.mod_legacy {
                     ui.horizontal(|ui| {
-                        ui.label("The last observed DeadlockShock mod predates version reporting.");
+                        ui.label("The last observed DeadlockShock mod does not report a version; compatibility cannot be verified.");
                         ui.hyperlink_to("Update mod", MOD_RELEASE_URL);
                     });
                 } else if self.version_warnings.mod_invalid {
                     ui.horizontal(|ui| {
-                        ui.label("The last observed DeadlockShock mod reported an invalid version; reinstall the latest mod.");
+                        ui.label("The last observed DeadlockShock mod reported an invalid version; compatibility cannot be verified.");
                         ui.hyperlink_to("Update mod", MOD_RELEASE_URL);
                     });
                 }
@@ -1986,6 +1986,7 @@ impl CompanionApp {
         egui::MenuBar::new().ui(ui, |ui| {
             ui.menu_button("Menu", |ui| {
                 ui.label(format!("Companion version: {}", app_version()));
+                ui.label(format!("Supported mod versions: {}", supported_mod_versions()));
                 let mod_label = match &self.state.bridge_listener.status().mod_version {
                     ModVersionObservation::Unknown => "unknown".to_owned(),
                     ModVersionObservation::Legacy => "legacy (no version reporting)".to_owned(),
